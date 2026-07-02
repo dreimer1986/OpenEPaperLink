@@ -181,6 +181,7 @@
 						<div class="lastseen"></div>
 						<div class="nextcheckin"></div>
 						<div class="nextupdate"></div>
+						<div class="uploadstatus" title="Data upload progress"></div>
 						<div class="corner">
 							<div class="waitingicon" title="New content is scheduled to be generated (as soon as possible, or shortly before the next expected checkin time)">&#9203;</div>
 							<div class="pendingicon" title="A new message is waiting for the tag to pick up">&circlearrowright;</div>
@@ -486,10 +487,6 @@ options:
 						<option value="0" selected>no</option>
 						<option value="1">yes</option>
 					</select>
-				</p>
-				<p title="API key for Open weather map API">
-					<label for="owm_api_key">OWM API key (optional)</label>
-					<input id="owm_api_key" type="text">
 				</p>
 				<p>
 					<input type="button" value="Save" id="apcfgsave"><span id="apcfgmsg"></span>
