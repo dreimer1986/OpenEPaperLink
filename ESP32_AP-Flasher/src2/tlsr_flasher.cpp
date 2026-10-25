@@ -228,6 +228,12 @@ static bool tlsrLoadFloader() {
     return false;
 }
 
+/* bringAPOnline() refuses while the state says flashing */
+static void tlsrResumeAP() {
+    setAPstate(false, AP_STATE_OFFLINE);
+    if (!bringAPOnline()) tlsrLog("TLSR: the radio doesn't respond. Try the update again.");
+}
+
 bool tlsrFlashFile(const String &path) {
     if (contentFS == nullptr) {
         printf("TLSR: filesystem not mounted yet\r\n");
@@ -244,20 +250,18 @@ bool tlsrFlashFile(const String &path) {
     /* Stop talking to the module first: the access point task keeps a UART
        conversation running with the very chip being flashed, and it owns the
        same port this needs. */
-    const bool wasRunning = (gSerialTaskState == SERIAL_STATE_RUNNING);
+    const bool wasRunning = apReaderRunning();
     if (wasRunning) {
         tlsrLog("TLSR: pausing access point communication");
         setAPstate(false, AP_STATE_FLASHING);
-        gSerialTaskState = SERIAL_STATE_STOP;
-        for (int i = 0; i < 300 && gSerialTaskState != SERIAL_STATE_STOPPED; i++) vTaskDelay(1);
-        gSerialTaskState = SERIAL_STATE_NONE;
+        stopApReader();
     }
 
     bool ok = false;
     for (int bringUp = 0; bringUp < 3 && !ok; bringUp++) ok = tlsrLoadFloader();
     if (!ok) {
         f.close();
-        if (wasRunning) bringAPOnline();
+        if (wasRunning) tlsrResumeAP();
         return false;
     }
 
@@ -313,7 +317,7 @@ bool tlsrFlashFile(const String &path) {
     }
     f.close();
     if (!ok) {
-        if (wasRunning) bringAPOnline();
+        if (wasRunning) tlsrResumeAP();
         return false;
     }
 
@@ -325,10 +329,8 @@ bool tlsrFlashFile(const String &path) {
     digitalWrite(config.flashPinReset, HIGH);
 
     if (wasRunning) {
-        tlsrLog("TLSR: restarting to bring the access point back up");
-        wsSerial("[autoreboot]");
-        vTaskDelay(1500 / portTICK_PERIOD_MS);
-        ESP.restart();
+        tlsrLog("TLSR: bringing the access point back online");
+        tlsrResumeAP();
     }
     return true;
 }

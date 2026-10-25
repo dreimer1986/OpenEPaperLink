@@ -84,34 +84,43 @@ window.addEventListener("loadConfig", function () {
 });
 
 window.addEventListener("load", function () {
-    const themeToggle = $('#theme-toggle');
-    if (themeToggle) {
-        const prefersDarkScheme = window.matchMedia('(prefers-color-scheme: dark)');
+	const themeToggle = $('#theme-toggle');
+	if (themeToggle) {
+		const THEME_STORAGE_KEY = 'theme';
+		const prefersDarkScheme = window.matchMedia('(prefers-color-scheme: dark)');
+		let hasExplicitPreference = localStorage.getItem(THEME_STORAGE_KEY) !== null;
 
-        const setTheme = (theme) => {
-            if (theme === 'dark') {
-                document.body.classList.add('dark-mode');
-                themeToggle.innerHTML = 'dark_mode';
-                localStorage.setItem('theme', 'dark');
-            } else {
-                document.body.classList.remove('dark-mode');
-                themeToggle.innerHTML = 'light_mode';
-                localStorage.setItem('theme', 'light');
-            }
-        };
+		const setTheme = (theme, persist = true) => {
+			const isDark = theme === 'dark';
+			document.body.classList.toggle('dark-mode', isDark);
+			themeToggle.innerHTML = isDark ? 'dark_mode' : 'light_mode';
+			themeToggle.title = isDark ? 'Switch to light mode' : 'Switch to dark mode';
+			themeToggle.setAttribute('aria-label', themeToggle.title);
+			if (persist) {
+				localStorage.setItem(THEME_STORAGE_KEY, theme);
+				hasExplicitPreference = true;
+			}
+		};
 
-        themeToggle.addEventListener('click', () => {
-            const isDarkMode = document.body.classList.contains('dark-mode');
-            setTheme(isDarkMode ? 'light' : 'dark');
-        });
+		themeToggle.addEventListener('click', () => {
+			const isDarkMode = document.body.classList.contains('dark-mode');
+			setTheme(isDarkMode ? 'light' : 'dark', true);
+		});
 
-        const savedTheme = localStorage.getItem('theme');
-        if (savedTheme) {
-            setTheme(savedTheme);
-        } else {
-            setTheme(prefersDarkScheme.matches ? 'dark' : 'light');
-        }
-    }
+		prefersDarkScheme.addEventListener('change', (event) => {
+			if (!hasExplicitPreference) {
+				setTheme(event.matches ? 'dark' : 'light', false);
+			}
+		});
+
+		const savedTheme = localStorage.getItem(THEME_STORAGE_KEY);
+		if (savedTheme === 'dark' || savedTheme === 'light') {
+			setTheme(savedTheme, false);
+		} else {
+			hasExplicitPreference = false;
+			setTheme(prefersDarkScheme.matches ? 'dark' : 'light', false);
+		}
+	}
 	window.dispatchEvent(loadConfig);
 	initTabs();
 	fetch('content_cards.json')
@@ -249,6 +258,7 @@ function connect() {
 			processTags(msg.tags);
 		}
 		if (msg.sys) {
+			Object.assign(lastSys, msg.sys);
 			let str = "";
 			str += `free heap: ${convertSize(msg.sys.heap)} &#x2507; `;
 			if (msg.sys.psfree) {
@@ -281,6 +291,7 @@ function connect() {
 			servertimediff = (Date.now() / 1000) - msg.sys.currtime;
 		}
 		if (msg.apitem) {
+			apList[msg.apitem.ip] = msg.apitem;
 			populateAPCard(msg.apitem);
 		}
 		if (msg.touch) {
@@ -365,7 +376,9 @@ function processTags(tagArray) {
 			$('#tag' + tagmac + ' .mac').innerHTML = tagmac;
 		}
 		let alias = element.alias;
-		if (!alias) {
+		if (!alias && tagmac.startsWith('2446')) {
+			alias = 'OD' + tagmac.slice(-6);  // OpenDisplay tags call themselves that
+		} else if (!alias) {
 			alias = tagmac.replace(/^0{1,4}/, '');
 			if (alias.match(/^4467/)) {
 				let macdigit = Number.parseInt(alias.substr(4, 2), 16) & 0x1f;
@@ -387,14 +400,23 @@ function processTags(tagArray) {
 			div.dataset.hwtype = element.hwType;
 			(async () => {
 				const localTagmac = tagmac;
-				const data = await getTagtype(element.hwType);
+				const data = await getTagtype(element.hwType, element.isexternal ? element.apip : null);
 				div.dataset.usetemplate = data.usetemplate;
 				if (data.usetemplate != 0) {
 					const template = await getTagtype(data.usetemplate);
+					// a type the AP made itself has no content list of its own
+					if (!data.contentids?.length && template?.contentids) data.contentids = template.contentids;
 				}
 				$('#tag' + localTagmac + ' .model').innerHTML = data.name;
 				$('#tag' + localTagmac + ' .resolution').innerHTML = data.width + "x" + data.height;
-				if (element.ver != 0 && element.ver != 1) {
+				if (element.od && element.hwType == 0x100) {
+					// OpenDisplay tag whose type the AP doesn't know yet
+					$('#tag' + localTagmac + ' .model').innerHTML = element.od.width ? 'OpenDisplay ' + element.od.colors : 'OpenDisplay, ' + element.od.state;
+					$('#tag' + localTagmac + ' .resolution').innerHTML = element.od.width ? element.od.width + "x" + element.od.height : '';
+				}
+				if (element.od && element.ver) {
+					$('#tag' + localTagmac + ' .resolution').innerHTML += ` fw:${element.ver >> 8}.${element.ver & 0xff}`;
+				} else if (element.ver != 0 && element.ver != 1) {
 					div.dataset.ver = element.ver;
 					$('#tag' + localTagmac + ' .resolution').innerHTML += ` fw:${element.ver} 0x${element.ver.toString(16)}`;
 				}
@@ -594,6 +616,7 @@ function updatecards() {
 	$('#dashboardPending').innerHTML = pendingcount;
 	$('#dashboardLowBatt').innerHTML = lowbattcount;
 	$('#dashboardTimeout').innerHTML = timeoutcount;
+	renderDashboard();
 }
 
 $('#clearlog').addEventListener("click", (event) => {
@@ -654,8 +677,47 @@ function loadContentCard(mac) {
 			$('#cfginvert').value = tagdata.invert;
 			$('#cfgmore').innerHTML = '&#x25BC;';
 			$('#cfgmac').dataset.ch = tagdata.ch;
+			loadOdKeyState(mac);
 			$('#configbox').showModal();
 		})
+}
+
+// OpenDisplay BLE tags: the AP only connects to tags the user added, with their key or without
+// one. It only says whether it has a key, never the key itself.
+function loadOdKeyState(mac) {
+	$('#cfgodkey').value = '';
+	$('#cfgodkeyrow').style.display = 'none';
+	$('#cfgodkeybuttons').style.display = 'none';
+	if (!mac.startsWith('2446')) return;
+	fetch('od_key?mac=' + mac)
+		.then(response => response.ok ? response.json() : null)
+		.then(state => {
+			if (!state) return;
+			$('#cfgodkey').placeholder = state.set ? 'set (type to replace)' : state.added ? 'added without key' : 'not added';
+			$('#cfgodkeyadd').style.display = state.added ? 'none' : '';
+			$('#cfgodkeyclear').style.display = state.added ? '' : 'none';
+			$('#cfgodkeyrow').style.display = '';
+			$('#cfgodkeybuttons').style.display = '';
+		});
+}
+
+function postOdKey(mac, params) {
+	let formData = new FormData();
+	formData.append("mac", mac);
+	for (const [name, value] of Object.entries(params)) formData.append(name, value);
+	return fetch("od_key", { method: "POST", body: formData })
+		.then(response => response.text().then(text => showMessage(text, !response.ok)))
+		.catch(error => showMessage('Error: ' + error, true));
+}
+
+$('#cfgodkeyadd').onclick = function () {
+	const mac = $('#cfgmac').dataset.mac;
+	postOdKey(mac, { add: 1 }).then(() => loadOdKeyState(mac));
+}
+
+$('#cfgodkeyclear').onclick = function () {
+	const mac = $('#cfgmac').dataset.mac;
+	postOdKey(mac, { key: '' }).then(() => loadOdKeyState(mac));
 }
 
 let typedString = '';
@@ -681,6 +743,14 @@ $('#cfgmore').onclick = function () {
 };
 
 $('#cfgsave').onclick = function () {
+	const odKey = $('#cfgodkey').value.trim();
+	if (odKey != '') {
+		if (!/^[0-9a-fA-F]{32}$/.test(odKey)) {
+			showMessage('The encryption key is 32 hex digits', true);
+			return;
+		}
+		postOdKey($('#cfgmac').dataset.mac, { key: odKey });
+	}
 	let contentMode = $('#cfgcontent').value;
 	let contentDef = getContentDefById(contentMode);
 	let extraoptions = contentDef?.param ?? null;
@@ -778,9 +848,9 @@ $('#cfgautoupdate').onclick = async function () {
 	var infourl = "https://raw.githubusercontent.com/" + repo + "/master/binaries/Tag/tagotaversions.json";
 	var info = "";
 	await fetch(infourl, { method: 'GET' }).then(await function (response) { return response.json(); }).then(await function (json) { info = json; });
-	var tagtype = ("0" + (Number($('#tag' + mac).dataset.hwtype).toString(16))).slice(-2).toUpperCase();
-	var name = info[0][tagtype]["type"];
-	if (name == "") {
+	var tagtype = hwTypeHex($('#tag' + mac).dataset.hwtype);
+	var name = info[0][tagtype]?.["type"];
+	if (!name) {
 		alert("Tag id not known");
 		return false;
 	}
@@ -867,6 +937,7 @@ $('#configbox').addEventListener('click', (event) => {
 
 document.addEventListener("loadTab", function (event) {
 	activeTab = event.detail;
+	document.body.dataset.tab = activeTab;
 	switch (event.detail) {
 		case 'configtab':
 		case 'aptab':
@@ -888,6 +959,7 @@ document.addEventListener("loadTab", function (event) {
 						$("#apcnightlyreboot").value = data.nightlyreboot;
 						$("#apclock").value = data.lock;
 						$("#apcwifipower").value = data.wifipower;
+						$("#apchotspotpw").value = data.hotspotpw || "";
 						$("#apctimezone").value = data.timezone;
 						$("#apcnight1").value = data.sleeptime1;
 						$("#apcnight2").value = data.sleeptime2;
@@ -927,6 +999,12 @@ $('#apcfgsave').onclick = function () {
 	formData.append('nightlyreboot', $('#apcnightlyreboot').value);
 	formData.append('lock', $('#apclock').value);
 	formData.append('wifipower', $('#apcwifipower').value);
+	const hotspotpw = $('#apchotspotpw').value;
+	if (hotspotpw.length > 0 && (hotspotpw.length < 8 || hotspotpw.length > 63)) {
+		$('#apcfgmsg').innerHTML = 'Hotspot password needs 8 to 63 characters';
+		return;
+	}
+	formData.append('hotspotpw', hotspotpw);
 	formData.append('timezone', $('#apctimezone').value);
 	formData.append('sleeptime1', $('#apcnight1').value);
 	formData.append('sleeptime2', $('#apcnight2').value);
@@ -1092,7 +1170,7 @@ function contentselected() {
 				case 'binfile':
 				case 'jsonfile':
 					input = document.createElement("select");
-					fetch('edit?list=%2F&recursive=1')
+					fetch('edit?list=%2F&recursive=1&nosize=1')
 						.then(response => response.json())
 						.then(data => {
 							let files = data.filter(item => item.type === "file" && (item.name.toLowerCase().endsWith(".jpg") || item.name.toLowerCase().endsWith(".jpeg")));
@@ -1318,7 +1396,7 @@ function processQueue() {
 		.then(response => response.arrayBuffer())
 		.then(buffer => {
 
-			drawCanvas(buffer, canvas, hwtype, id, true);
+			drawCanvas(buffer, canvas, hwtype, id);
 			processQueue();
 		})
 		.catch(error => {
@@ -1327,7 +1405,7 @@ function processQueue() {
 		});
 }
 
-function drawCanvas(buffer, canvas, hwtype, tagmac, doRotate) {
+function drawCanvas(buffer, canvas, hwtype, tagmac) {
 	data = new Uint8ClampedArray(buffer);
 	if (data.length > 0 && tagTypes[hwtype].zlib > 0 && $('#tag' + tagmac).dataset.ver >= tagTypes[hwtype].zlib) {
 		data = processZlib(data);
@@ -1346,20 +1424,6 @@ function drawCanvas(buffer, canvas, hwtype, tagmac, doRotate) {
 	[canvas.width, canvas.height] = [tagTypes[hwtype].width, tagTypes[hwtype].height] || [0, 0];
 	if (tagTypes[hwtype].rotatebuffer % 2) [canvas.width, canvas.height] = [canvas.height, canvas.width];
 	if (tagTypes[hwtype].rotatebuffer >= 2) canvas.style.transform = 'rotate(180deg)';
-	if (doRotate == false && tagTypes[hwtype].rotatebuffer == 1) {
-		canvas.style.transform = 'rotate(90deg)';
-		canvas.style.transformOrigin = 'top left';
-		canvas.style.position = 'absolute';
-		canvas.style.left = canvas.height + 15;
-		canvas.style.top = 15;
-	}
-	if (doRotate == false && tagTypes[hwtype].rotatebuffer == 3) {
-		canvas.style.transform = 'rotate(270deg)';
-		canvas.style.transformOrigin = 'top left';
-		canvas.style.position = 'absolute';
-		canvas.style.top = (canvas.width + 15) + 'px';
-		canvas.style.left = 15;
-	}
 	const ctx = canvas.getContext('2d');
 	const imageData = ctx.createImageData(canvas.width, canvas.height);
 	if (data.length == 0) {
@@ -1568,11 +1632,12 @@ $('#activefilter').addEventListener('click', (event) => {
 	filterOptions.style.maxHeight = filterOptions.scrollHeight + 20 + 'px';
 });
 
-const downloadTagtype = async (hwtype) => {
+// from the repo, or with fromAp from another AP (the AP's own types above 0xFF)
+const downloadTagtype = async (hwtype, fromAp) => {
 	try {
 		console.log("download tagtype " + hwtype);
 		let repo = apConfig.repo || 'OpenEPaperLink/OpenEPaperLink';
-		let url = "https://raw.githubusercontent.com/" + repo + "/master/resources/tagtypes/" + hwtype + ".json";
+		let url = fromAp ? "http://" + fromAp + "/tagtypes/" + hwtype + ".json" : "https://raw.githubusercontent.com/" + repo + "/master/resources/tagtypes/" + hwtype + ".json";
 		console.log(url);
 
 		const response = await fetch(url);
@@ -1602,7 +1667,13 @@ const downloadTagtype = async (hwtype) => {
 	}
 };
 
-async function getTagtype(hwtype) {
+// tag type id as used in the file name: two hex digits, four above 0xFF
+function hwTypeHex(hwtype) {
+	return Number(hwtype).toString(16).toUpperCase().padStart(Number(hwtype) > 0xFF ? 4 : 2, '0');
+}
+
+// apip: the AP that has the tag, for a type of its own (above 0xFF) that this AP doesn't have
+async function getTagtype(hwtype, apip) {
 	if (tagTypes[hwtype] && tagTypes[hwtype].busy == false) {
 		return tagTypes[hwtype];
 	}
@@ -1644,14 +1715,17 @@ async function getTagtype(hwtype) {
 	try {
 		getTagtypeBusy = true;
 		tagTypes[hwtype] = { busy: true };
-		let response = await fetch('tagtypes/' + hwtype.toString(16).padStart(2, '0').toUpperCase() + '.json');
+		let response = await fetch('tagtypes/' + hwTypeHex(hwtype) + '.json');
 
-		if (response.status === 404) {
-			response = await downloadTagtype(hwtype.toString(16).padStart(2, '0').toUpperCase());
+		// types above 0xFF are made by an AP itself, the repo doesn't have them
+		if (response.status === 404 && hwtype <= 0xFF) {
+			response = await downloadTagtype(hwTypeHex(hwtype));
+		} else if (response.status === 404 && apip && apip != '0.0.0.0') {
+			response = await downloadTagtype(hwTypeHex(hwtype), apip);
 		}
 
 		if (!response.ok) {
-			let data = { name: 'unknown id ' + hwtype.toString(16).toUpperCase(), width: 0, height: 0, bpp: 0, rotatebuffer: 0, colortable: [], busy: false };
+			let data = { name: 'unknown id ' + hwtype.toString(16).toUpperCase(), width: 0, height: 0, bpp: 0, rotatebuffer: 0, colortable: [], busy: false, usetemplate: 0 };
 			tagTypes[hwtype] = data;
 			getTagtypeBusy = false;
 			return data;
@@ -1983,7 +2057,7 @@ function formatEpoch(epochTime) {
 }
 
 function setFilterAndShow(filter) {
-	$('input[name="filter"][value="remote"]').checked = false;
+	$('input[name="filter"][value="remote"]').checked = (filter == 'remote');
 	$('input[name="filter"][value="local"]').checked = false;
 	$('input[name="filter"][value="inactive"]').checked = (filter == 'inactive');
 	$('input[name="filter"][value="pending"]').checked = (filter == 'pending');
@@ -1991,6 +2065,287 @@ function setFilterAndShow(filter) {
 	GroupSortFilter();
 	$(`[data-target='tagtab']`).click();
 }
+
+/* dashboard (home tab) */
+const apList = {};
+const lastSys = {};
+let sysInfo = {};
+let latestRelease = null;
+let dbSysinfoFetched = 0, dbLogFetched = 0, dbApsFetched = 0, dbReleaseChecked = false;
+
+const dbEsc = text => htmlEncode(String(text ?? ''));
+
+function dbAgo(seconds) {
+	seconds = Math.max(0, seconds);
+	if (seconds < 60) return Math.round(seconds) + 's ago';
+	if (seconds < 3600) return Math.round(seconds / 60) + ' min ago';
+	if (seconds < 48 * 3600) return Math.round(seconds / 3600) + ' h ago';
+	return Math.round(seconds / 86400) + ' days ago';
+}
+
+function dbIn(seconds) {
+	if (seconds < 60) return 'in ' + Math.max(0, Math.round(seconds)) + 's';
+	if (seconds < 3600) return 'in ' + Math.floor(seconds / 60) + 'm ' + String(Math.round(seconds % 60)).padStart(2, '0') + 's';
+	if (seconds < 48 * 3600) return 'in ' + Math.floor(seconds / 3600) + 'h ' + String(Math.floor((seconds % 3600) / 60)).padStart(2, '0') + 'm';
+	return 'in ' + Math.round(seconds / 86400) + ' days';
+}
+
+// Only touch the DOM when something changed: keeps hover states and avoids flicker.
+function dbSet(id, html) {
+	const el = document.getElementById(id);
+	if (el && el.dataset.html !== html) {
+		el.innerHTML = html;
+		el.dataset.html = html;
+	}
+}
+
+function dbSameVersion(a, b) {
+	const norm = v => String(v).replace(/(\.\d*?)0+$/, '$1').replace(/\.$/, '');
+	return norm(a) == norm(b);
+}
+
+function dbDist(id, rows, color) {
+	const max = Math.max(1, ...rows.map(r => r[1]));
+	const html = rows.map(([label, n, c]) => `<span class="lbl" title="${dbEsc(label)}">${dbEsc(label)}</span>` +
+		`<div class="track"><div class="fill" style="width:${n / max * 100}%;--c:var(${c || color})"></div></div><span class="n">${n}</span>`).join('');
+	dbSet(id, html || '<span class="lbl">no data</span>');
+}
+
+function dbMeter(label, used, total, color, hint) {
+	const pct = total ? Math.min(100, used / total * 100) : 0;
+	return `<div class="dmeter" style="--c:var(${color})"><div class="top">${label} <span>${convertSize(total - used)} free of ${convertSize(total)}</span></div>` +
+		`<div class="track"><div class="fill" style="width:${pct.toFixed(1)}%"></div></div>${hint ? `<div class="hint">${hint}</div>` : ''}</div>`;
+}
+
+function dbFetchSysinfo() {
+	dbSysinfoFetched = Date.now();
+	fetch('sysinfo')
+		.then(response => response.json())
+		.then(data => {
+			sysInfo = data;
+			if (!dbReleaseChecked) dbCheckRelease();
+		})
+		.catch(() => { });
+}
+
+function dbFetchLog() {
+	dbLogFetched = Date.now();
+	fetch('edit?edit=log.txt', { cache: 'no-store' })
+		.then(response => response.ok ? response.text() : '')
+		.then(text => {
+			const lines = text.split('\n').map(l => l.trim()).filter(l => l).slice(-6).reverse();
+			dbSet('dbLog', lines.length ? lines.map(l => {
+				const err = /crash|backtrace|error|fail|panic|watchdog|brownout/i.test(l);
+				return `<div class="${err ? 'err' : ''}" title="${dbEsc(l)}">${dbEsc(l)}</div>`;
+			}).join('') : '<div>log is empty</div>');
+		})
+		.catch(() => { });
+}
+
+// Once per page load, cached for 12 hours: the GitHub API allows 60 requests per hour.
+function dbCheckRelease() {
+	if (!sysInfo.buildversion) return;
+	dbReleaseChecked = true;
+	const repo = apConfig.repo || 'OpenEPaperLink/OpenEPaperLink';
+	const key = 'latestRelease:' + repo;
+	try {
+		const cached = JSON.parse(localStorage.getItem(key) || 'null');
+		if (cached && Date.now() - cached.checked < 12 * 3600 * 1000) {
+			latestRelease = cached;
+			return;
+		}
+	} catch (e) { }
+	fetch('https://api.github.com/repos/' + repo + '/releases')
+		.then(response => response.json())
+		.then(releases => {
+			const env = apConfig.env || sysInfo.env;
+			const release = releases.find(r => r.assets.some(a => a.name === 'binaries.json') && r.assets.some(a => a.name === env + '.bin'));
+			if (!release) return;
+			latestRelease = { tag: release.tag_name, published: Date.parse(release.published_at) / 1000, checked: Date.now() };
+			try { localStorage.setItem(key, JSON.stringify(latestRelease)); } catch (e) { }
+		})
+		.catch(() => { });
+}
+
+function openUpdatePage() {
+	$(`[data-target='configtab']`).click();
+	$('#updatebutton').click();
+}
+
+function renderDashboard() {
+	if (activeTab != 'hometab') return;
+	const now = Date.now() / 1000 - servertimediff;
+
+	if (Date.now() - dbSysinfoFetched > 60000) dbFetchSysinfo();
+	if (Date.now() - dbLogFetched > 60000) dbFetchLog();
+	// get_ap_config makes the AP announce itself and ask the other APs; the answers arrive over the websocket
+	if (socket && socket.readyState == 1 && Date.now() - dbApsFetched > 300000) {
+		dbApsFetched = Date.now();
+		fetch('get_ap_config').catch(() => { });
+	}
+
+	const attention = [], next = [], recent = [];
+	let updated = 0, external = 0, local = 0;
+	const batt = [0, 0, 0, 0], rssi = [0, 0, 0, 0], content = {}, types = {};
+
+	$('#taglist').querySelectorAll('[data-mac]').forEach(item => {
+		const mac = item.dataset.mac, tag = tagDB[mac];
+		if (!tag) return;
+		const name = item.querySelector('.alias')?.textContent || mac;
+		if (tag.isexternal) external++; else local++;
+		if (tag.updatelast > now - 3600) updated++;
+
+		const timeout = item.classList.contains('state-timeout');
+		if (timeout) {
+			attention.push([0, 'signal_disconnected', '--dash-red', name, 'timeout', 'last seen ' + dbAgo(now - tag.lastseen), mac]);
+		} else if (tag.nextupdate > 1672531200 && tag.nextupdate != 3216153600 && tag.nextupdate < now - 900) {
+			attention.push([1, 'running_with_errors', '--dash-blue', name, 'content overdue', dbAgo(now - tag.nextupdate).replace(' ago', ' late'), mac]);
+		}
+		if (tag.wakeupReason == WAKEUP_REASON_FAILED_OTA_FW) attention.push([1, 'system_update', '--dash-red', name, 'firmware update rejected', '', mac]);
+		if (tag.wakeupReason == WAKEUP_REASON_WDT_RESET) attention.push([2, 'restart_alt', '--dash-yellow', name, 'watchdog reset', '', mac]);
+
+		const mv = tag.batteryMv;
+		const knownBatt = mv != 0 && mv != 1337;
+		if (knownBatt && mv < 2400) attention.push([2, 'battery_alert', '--dash-yellow', name, 'low battery', (mv / 1000).toFixed(2) + ' V', mac]);
+		const radio = tag.RSSI && tag.RSSI != 100;
+		if (radio && tag.RSSI < -85 && !timeout) attention.push([3, 'signal_cellular_1_bar', '--dash-yellow', name, 'weak signal', tag.RSSI + ' dBm', mac]);
+
+		if (knownBatt) batt[mv > 2800 ? 0 : mv > 2600 ? 1 : mv >= 2400 ? 2 : 3]++;
+		if (radio) rssi[tag.RSSI >= -65 ? 0 : tag.RSSI >= -75 ? 1 : tag.RSSI >= -85 ? 2 : 3]++;
+		const contentName = getContentDefById(tag.contentMode)?.name;
+		if (contentName) content[contentName] = (content[contentName] || 0) + 1;
+		if (tag.RSSI) {
+			const typeName = tagTypes[tag.hwType]?.name || 'type ' + hwTypeHex(tag.hwType);
+			types[typeName] = (types[typeName] || 0) + 1;
+		}
+
+		if (tag.nextupdate > now && tag.nextupdate != 3216153600) next.push([tag.nextupdate, name, contentName || '', mac]);
+		const canvas = item.querySelector('.tagimg');
+		if (tag.updatelast > 0 && canvas && canvas.style.display == 'block' && canvas.width > 0) recent.push([tag.updatelast, name, canvas, mac]);
+	});
+
+	// status
+	dbSet('dbAlias', dbEsc(apConfig.alias || 'OpenEPaperLink AP'));
+	dbSet('dbServing', `&middot; ${local} tag${local == 1 ? '' : 's'}`);
+	if (sysInfo.env) {
+		const radioFw = sysInfo.ap_version ? ' &middot; fw ' + Number(sysInfo.ap_version).toString(16).toUpperCase().padStart(4, '0') : '';
+		const channel = sysInfo.channel || apConfig.channel;
+		dbSet('dbRadio', sysInfo.ap_type || sysInfo.ap_version ? `${dbEsc(sysInfo.ap_typename || 'radio')}${channel ? ' &middot; channel ' + channel : ''}${radioFw}` : 'none');
+		let fw = dbEsc(sysInfo.buildversion);
+		if (latestRelease && !dbSameVersion(latestRelease.tag, sysInfo.buildversion) && latestRelease.published > Number(sysInfo.buildtime) + 1800) {
+			fw += `<span class="dbadge" onclick="openUpdatePage()" title="Open the update page">${dbEsc(latestRelease.tag)} available</span>`;
+		}
+		dbSet('dbFirmware', fw);
+	}
+	if (lastSys.uptime !== undefined) {
+		if (lastSys.wifissid) {
+			const level = lastSys.rssi >= -55 ? 4 : lastSys.rssi >= -65 ? 3 : lastSys.rssi >= -75 ? 2 : 1;
+			const bars = [4, 7, 10, 14].map((h, i) => `<i class="${i < level ? 'on' : ''}" style="height:${h}px"></i>`).join('');
+			dbSet('dbNetwork', `<span class="dbars">${bars}</span>${dbEsc(lastSys.wifissid)} &middot; ${lastSys.rssi} dBm`);
+		} else {
+			dbSet('dbNetwork', 'Ethernet');
+		}
+		$('#dbUptime').textContent = formatUptime(lastSys.uptime + Math.max(0, Math.round(now - lastSys.currtime)));
+	}
+	const timeText = new Date(now * 1000).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+	$('#dbTime').textContent = timeText + (sysInfo.env && !sysInfo.ntpsync ? ' (not synced)' : '');
+
+	// tiles
+	dbSet('dbUpdated', String(updated));
+	dbSet('dbExternal', String(external));
+
+	// needs attention
+	attention.sort((a, b) => a[0] - b[0]);
+	let html = attention.slice(0, 8).map(([, icon, color, name, why, value, mac]) =>
+		`<li data-mac="${mac}"><span class="material-symbols-outlined dot" style="--c:var(${color})">${icon}</span>` +
+		`<span class="name">${dbEsc(name)}<small>${why}</small></span><span class="val">${value}</span></li>`).join('');
+	if (attention.length > 8) html += `<li onclick="setFilterAndShow('')"><span class="name"><small>and ${attention.length - 8} more</small></span></li>`;
+	dbSet('dbAttention', html || '<div class="dempty"><span class="material-symbols-outlined">task_alt</span>All tags are fine</div>');
+
+	// just updated: copies of the previews the tag cards already decoded
+	$('#dbThumbCard').style.display = apConfig.preview == 0 ? 'none' : '';
+	recent.sort((a, b) => b[0] - a[0]);
+	const shown = recent.slice(0, 6);
+	dbSet('dbThumbs', shown.length ? shown.map(([, name, , mac]) =>
+		`<div class="thumb" data-mac="${mac}"><span class="frame"><canvas></canvas></span><div>${dbEsc(name)}</div><small></small></div>`).join('')
+		: '<div class="dempty muted">No previews yet</div>');
+	shown.forEach(([time, , source, mac]) => {
+		const thumb = $(`#dbThumbs [data-mac="${mac}"]`);
+		if (!thumb) return;
+		const canvas = thumb.querySelector('canvas');
+		if (canvas.width != source.width || canvas.height != source.height) [canvas.width, canvas.height] = [source.width, source.height];
+		canvas.getContext('2d').drawImage(source, 0, 0);
+		canvas.style.transform = source.style.transform;
+		thumb.querySelector('small').textContent = dbAgo(now - time);
+	});
+
+	// next updates
+	next.sort((a, b) => a[0] - b[0]);
+	dbSet('dbNext', next.slice(0, 6).map(([time, name, contentName, mac]) =>
+		`<li data-mac="${mac}"><span class="material-symbols-outlined dot" style="--c:var(--dash-teal)">schedule</span>` +
+		`<span class="name">${dbEsc(name)}<small>${dbEsc(contentName)}</small></span><span class="val" data-time="${time}"></span></li>`).join('')
+		|| '<div class="dempty muted">Nothing scheduled</div>');
+	document.querySelectorAll('#dbNext .val').forEach(el => el.textContent = dbIn(el.dataset.time - now));
+
+	// fleet
+	dbDist('dbDistBatt', [['> 2.8 V', batt[0], '--dash-ok'], ['2.6 - 2.8 V', batt[1], '--dash-ok'], ['2.4 - 2.6 V', batt[2], '--dash-yellow'], ['< 2.4 V', batt[3], '--dash-red']]);
+	dbDist('dbDistRssi', [['strong', rssi[0], '--dash-ok'], ['good', rssi[1], '--dash-ok'], ['fair', rssi[2], '--dash-yellow'], ['weak', rssi[3], '--dash-red']]);
+	const top = (obj, n) => Object.entries(obj).sort((a, b) => b[1] - a[1]).slice(0, n);
+	dbDist('dbDistContent', top(content, 6), '--dash-purple');
+	dbDist('dbDistTypes', top(types, 6), '--dash-blue');
+
+	// system
+	if (lastSys.heap !== undefined) {
+		let sys = '';
+		if (sysInfo.heapsize) sys += dbMeter('Heap', sysInfo.heapsize - lastSys.heap, sysInfo.heapsize, '--dash-blue');
+		if (sysInfo.psramsize && lastSys.psfree !== undefined) sys += dbMeter('PSRAM', sysInfo.psramsize - lastSys.psfree, sysInfo.psramsize, '--dash-purple');
+		if (sysInfo.fssize) {
+			const free = lastSys.littlefsfree;
+			const color = free < 31000 ? '--dash-red' : free < 150000 ? '--dash-yellow' : '--dash-ok';
+			const hint = free < 31000 ? 'File system full: content generation is paused' : free < 150000 ? 'Content generation pauses below 31 KB free' : '';
+			sys += dbMeter('File system', sysInfo.fssize - free, sysInfo.fssize, color, hint);
+		}
+		sys += '<div class="dkv">';
+		sys += `<span>Tag database</span><span>${lastSys.recordcount} records &middot; ${convertSize(lastSys.dbsize)}</span>`;
+		if (sysInfo.env) {
+			sys += `<span>Build</span><span>${dbEsc(sysInfo.env)} &middot; ${formatEpoch(sysInfo.buildtime)}</span>`;
+			if (sysInfo.resetreason) {
+				const boot = dbAgo(lastSys.uptime + Math.max(0, now - lastSys.currtime));
+				sys += `<span>Last restart</span><span${sysInfo.crashed ? ' class="bad"' : ''}>${boot} &middot; ${dbEsc(sysInfo.resetreason)}${sysInfo.crashed ? ', crash details in the log' : ''}</span>`;
+			}
+			if (sysInfo.ntpserver !== undefined) {
+				sys += sysInfo.ntpsync
+					? `<span>Time sync</span><span>${dbEsc(sysInfo.ntpserver)} &middot; ${dbAgo(now - sysInfo.ntpsync)}</span>`
+					: `<span>Time sync</span><span class="bad">not synced yet${sysInfo.ntpserver ? ' (' + dbEsc(sysInfo.ntpserver) + ')' : ''}</span>`;
+			}
+		}
+		sys += '</div>';
+		dbSet('dbSystem', sys);
+	}
+
+	// access points
+	const aps = Object.values(apList).sort((a, b) => (b.ip == location.hostname) - (a.ip == location.hostname) || a.ip.localeCompare(b.ip, undefined, { numeric: true }));
+	dbSet('dbAps', aps.map(ap => {
+		const self = ap.ip == location.hostname;
+		const conflict = ap.channel && aps.some(other => other !== ap && other.channel == ap.channel);
+		return `<li data-ap="${self ? '' : dbEsc(ap.ip)}"><span class="material-symbols-outlined dot" style="--c:var(${conflict ? '--dash-red' : '--dash-ok'})">radio_button_checked</span>` +
+			`<span class="name">${dbEsc(ap.alias || (self ? apConfig.alias || 'OpenEPaperLink AP' : ap.ip))}<small>${dbEsc(ap.ip)}${self ? ' &middot; this AP' : ''}</small></span>` +
+			`<span class="val${conflict ? ' bad' : ''}">ch ${ap.channel}${conflict ? ' conflict' : ''} &middot; ${ap.count} tags</span></li>`;
+	}).join('') || '<div class="dempty muted">Looking for access points...</div>');
+}
+
+$('#hometab').addEventListener('click', (event) => {
+	const tagItem = event.target.closest('[data-mac]');
+	if (tagItem) {
+		loadContentCard(tagItem.dataset.mac);
+		return;
+	}
+	const apItem = event.target.closest('[data-ap]');
+	if (apItem) {
+		if (apItem.dataset.ap) window.open('http://' + apItem.dataset.ap, '_blank');
+		else $(`[data-target='aptab']`).click();
+	}
+});
 
 // geocoding typeahead
 
@@ -2054,10 +2409,19 @@ function backupTagDB() {
 	localStorage.setItem("tagDB", JSON.stringify(tagDB));
 }
 
+// margin around the preview in its window, in CSS pixels
+const previewMargin = 15;
+
 function openPreview(mac, w, h) {
-	const previewWindow = window.open("", `PreviewWindow_${mac}`, `width=${w + 30},height=${h + 30},menubar=no,toolbar=no,location=no,status=no,resizable=no,scrollbars=no`);
+	const size = previewSize(w, h);
+	// centre it on this window, so it lands on the same screen
+	const left = Math.round(window.screenX + (window.outerWidth - size.w) / 2);
+	const top = Math.round(window.screenY + (window.outerHeight - size.h) / 2);
+	const previewWindow = window.open("", `PreviewWindow_${mac}`, `popup,width=${size.w},height=${size.h},left=${left},top=${top}`);
 
 	if (previewWindow) {
+		// a preview of this tag that is already open stays where the user put it
+		const isNew = !previewWindow.document.getElementById('preview');
 		previewWindow.mac = mac;
 		previewWindows.push(previewWindow);
 		const element = tagDB[mac];
@@ -2066,13 +2430,21 @@ function openPreview(mac, w, h) {
 		previewWindow.pending = 0;
 		previewWindow.focus();
 
-		console.log(element);
-		console.log(tagTypes[element.hwType]);
 		previewWindow.document.head.innerHTML = `<title>${tagTypes[element.hwType].name + ' ' + mac}</title>`;
-		previewWindow.document.body.style.backgroundColor = "#dddddd";
-		previewWindow.document.body.style.margin = "15px";
-		previewWindow.document.body.style.overflow = "hidden";
-		previewWindow.document.body.innerHTML = `<canvas id="preview" style="border:1px solid #888888;image-rendering: pixelated;"></canvas>`;
+		const body = previewWindow.document.body;
+		body.style.cssText = `margin:0;height:100vh;overflow:hidden;background:#dddddd;display:flex;align-items:center;justify-content:center`;
+		body.innerHTML = `<canvas id="preview" style="border:1px solid #888888;image-rendering:pixelated;box-sizing:content-box"></canvas>`;
+
+		// browsers may ignore the size given to window.open (Chrome opens it as large as its own window):
+		// size and centre it once it exists, then let the preview follow the window when the user resizes it
+		if (isNew) setTimeout(() => {
+			const outerW = size.w + previewWindow.outerWidth - previewWindow.innerWidth;
+			const outerH = size.h + previewWindow.outerHeight - previewWindow.innerHeight;
+			previewWindow.resizeTo(outerW, outerH);
+			previewWindow.moveTo(Math.round(window.screenX + (window.outerWidth - outerW) / 2),
+				Math.round(window.screenY + (window.outerHeight - outerH) / 2));
+		}, 50);
+		previewWindow.addEventListener('resize', () => fitPreview(previewWindow));
 
 		showPreview(previewWindow, element);
 
@@ -2118,10 +2490,34 @@ function showPreview(previewWindow, element) {
 		fetch(imageSrc)
 			.then(response => response.arrayBuffer())
 			.then(buffer => {
-				drawCanvas(buffer, canvas, element.hwType, element.mac, false);
+				// decode as on the tag cards, then turn the buffer the way the tag shows it
+				const buf = document.createElement('canvas');
+				drawCanvas(buffer, buf, element.hwType, element.mac);
+				const turns = (tagTypes[element.hwType].rotatebuffer || 0) % 4;
+				[canvas.width, canvas.height] = turns % 2 ? [buf.height, buf.width] : [buf.width, buf.height];
+				const ctx = canvas.getContext('2d');
+				ctx.translate(canvas.width / 2, canvas.height / 2);
+				ctx.rotate(turns * Math.PI / 2);
+				ctx.drawImage(buf, -buf.width / 2, -buf.height / 2);
+				fitPreview(previewWindow);
 			})
 			.catch(error => {
 				console.error('fetch preview image error:', error);
 			});
 	}
+}
+
+// window size (inner, CSS pixels) that shows a w x h preview at its own size
+function previewSize(w, h) {
+	return { w: w + 2 * previewMargin + 2, h: h + 2 * previewMargin + 2 };
+}
+
+// scale the preview to the largest size that fits the window, keeping its aspect ratio
+function fitPreview(previewWindow) {
+	const canvas = previewWindow.document.getElementById('preview');
+	if (!canvas || !canvas.width || !canvas.height) return;
+	const scale = Math.min((previewWindow.innerWidth - 2 * previewMargin - 2) / canvas.width,
+		(previewWindow.innerHeight - 2 * previewMargin - 2) / canvas.height);
+	canvas.style.width = Math.max(1, Math.floor(canvas.width * scale)) + 'px';
+	canvas.style.height = Math.max(1, Math.floor(canvas.height * scale)) + 'px';
 }

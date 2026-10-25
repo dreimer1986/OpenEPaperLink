@@ -4,6 +4,7 @@
 #include <ArduinoJson.h>
 #include <FS.h>
 #include <HTTPClient.h>
+#include <WiFiClientSecure.h>
 #include <MD5Builder.h>
 #include <Update.h>
 
@@ -12,8 +13,10 @@
 #include "leds.h"
 #include "serialap.h"
 #include "storage.h"
+#include "system.h"
 #include "tag_db.h"
 #include "util.h"
+#include "uploadinfo.h"
 #include "web.h"
 
 
@@ -24,7 +27,7 @@
 #define BUILD_TIME 0
 #endif
 #ifndef BUILD_VERSION
-#define BUILD_VERSION custom
+#define BUILD_VERSION "custom"
 #endif
 #ifndef SHA
 #define SHA 0
@@ -40,7 +43,7 @@ void handleSysinfoRequest(AsyncWebServerRequest* request) {
     doc["alias"] = config.alias;
     doc["env"] = STR(BUILD_ENV_NAME);
     doc["buildtime"] = STR(BUILD_TIME);
-    doc["buildversion"] = STR(BUILD_VERSION);
+    doc["buildversion"] = BUILD_VERSION;
     doc["sha"] = STR(SHA);
     doc["psramsize"] = ESP.getPsramSize();
     doc["flashsize"] = ESP.getFlashChipSize();
@@ -48,6 +51,14 @@ void handleSysinfoRequest(AsyncWebServerRequest* request) {
     doc["ap_version"] = apInfo.version;
     doc["ap_type"] = apInfo.type;
     doc["ap_typename"] = apTypeName(apInfo.type);
+    doc["channel"] = apInfo.channel;
+    doc["heapsize"] = ESP.getHeapSize();
+    doc["fssize"] = Storage.totalSpace();
+    doc["resetreason"] = resetReasonName();
+    doc["crashed"] = crashedLastBoot();
+    doc["ntpserver"] = ntpServerName();
+    doc["ntpsync"] = lastTimeSync();
+    doc["currtime"] = time(nullptr);
 #ifdef FLASHER_AP_SWS
     doc["has_sws_flasher"] = 1;
 #else
@@ -130,83 +141,33 @@ void handleCheckFile(AsyncWebServerRequest* request) {
     request->send(200, "application/json", jsonResponse);
 }
 
-#define UPLOAD_BUFFER_SIZE 32768
-
-struct UploadInfo {
-    String filename;
-    uint8_t buffer[UPLOAD_BUFFER_SIZE];
-    size_t bufferSize;
-};
-
 void handleLittleFSUpload(AsyncWebServerRequest* request, String filename, size_t index, uint8_t* data, size_t len, bool final) {
-    String uploadfilename;
-    bool error = false;
     if (!index) {
-        String path;
         if (!request->hasParam("path", true)) {
-            final = true;
-            error = true;
-        } else {
-            uploadfilename = request->getParam("path", true)->value();
-            Serial.println("update " + uploadfilename);
-            File file = contentFS->open(uploadfilename, "w");
-            file.close();
-            UploadInfo* uploadInfo = new UploadInfo{uploadfilename, {}, 0};
-            request->_tempObject = (void*)uploadInfo;
+            request->send(400, "text/plain", "parameters incomplete");
+            return;
         }
+        const String uploadfilename = request->getParam("path", true)->value();
+        Serial.println("update " + uploadfilename);
+        if (beginUpload(request, uploadfilename) == nullptr) return;
     }
 
     UploadInfo* uploadInfo = static_cast<UploadInfo*>(request->_tempObject);
+    if (uploadInfo == nullptr) return;
 
-    if (uploadInfo != nullptr) {
-        uploadfilename = uploadInfo->filename;
+    if (len) appendUploadInfo(uploadInfo, data, len);
+    if (!final) return;
 
-        if (len) {
-            if (uploadInfo->bufferSize + len <= UPLOAD_BUFFER_SIZE) {
-                memcpy(&uploadInfo->buffer[uploadInfo->bufferSize], data, len);
-                uploadInfo->bufferSize += len;
-            } else {
-                xSemaphoreTake(fsMutex, portMAX_DELAY);
-                File file = contentFS->open(uploadfilename, "a");
-                if (file) {
-                    file.write(uploadInfo->buffer, uploadInfo->bufferSize);
-                    file.close();
-                    uploadInfo->bufferSize = 0;
-                    xSemaphoreGive(fsMutex);
-                } else {
-                    xSemaphoreGive(fsMutex);
-                    logLine("Failed to open file for appending: " + uploadfilename);
-                    final = true;
-                    error = true;
-                }
+    flushUploadInfo(uploadInfo);
+    const bool error = uploadInfo->error;
+    if (error) logLine("Failed to write " + String(uploadInfo->filename));
+    request->_tempObject = nullptr;
+    free(uploadInfo);
 
-                memcpy(uploadInfo->buffer, data, len);
-                uploadInfo->bufferSize = len;
-            }
-        }
-        if (final) {
-            if (uploadInfo->bufferSize > 0) {
-                xSemaphoreTake(fsMutex, portMAX_DELAY);
-                File file = contentFS->open(uploadfilename, "a");
-                if (file) {
-                    file.write(uploadInfo->buffer, uploadInfo->bufferSize);
-                    file.close();
-                    xSemaphoreGive(fsMutex);
-                } else {
-                    xSemaphoreGive(fsMutex);
-                    logLine("Failed to open file for appending: " + uploadfilename);
-                    error = true;
-                }
-                request->_tempObject = nullptr;
-                delete uploadInfo;
-            }
-
-            if (error) {
-                request->send(507, "text/plain", "Error. Disk full?");
-            } else {
-                request->send(200, "text/plain", "Ok, file written");
-            }
-        }
+    if (error) {
+        request->send(507, "text/plain", "Error. Disk full?");
+    } else {
+        request->send(200, "text/plain", "Ok, file written");
     }
 }
 
@@ -222,7 +183,8 @@ void handleUpdateOTA(AsyncWebServerRequest* request) {
         params->url = request->getParam("url", true)->value();
         params->md5 = request->getParam("md5", true)->value();
         params->size = request->getParam("size", true)->value().toInt();
-        xTaskCreate(firmwareUpdateTask, "OTAUpdateTask", 6144, params, 10, NULL);
+        // the firmware comes straight from GitHub: TLS handshake on the stack, see handleUpdateC6
+        xTaskCreate(firmwareUpdateTask, "OTAUpdateTask", 10240, params, 10, NULL);
 
         request->send(200, "text/plain", "In progress");
     } else {
@@ -281,7 +243,15 @@ void updateFirmware(const char* url, const char* expectedMd5, const size_t size)
                 }
             });
 
-            const size_t written = Update.writeStream(httpClient.getStream());
+            // writeStream() checks the image header with a non-blocking peek() first: when the body
+            // hasn't arrived yet (GET() returns after the headers), that fails at once, as a wrong
+            // magic byte. Wait for the first bytes.
+            WiFiClient &stream = httpClient.getStream();
+            const uint32_t waitStart = millis();
+            while (stream.available() == 0 && stream.connected() && millis() - waitStart < 10000) {
+                vTaskDelay(10 / portTICK_PERIOD_MS);
+            }
+            const size_t written = Update.writeStream(stream);
             if (written == httpClient.getSize()) {
                 if (Update.end(true)) {
                     wsSerial("Firmware update successful");
@@ -307,6 +277,84 @@ void updateFirmware(const char* url, const char* expectedMd5, const size_t size)
 
     httpClient.end();
     config.runStatus = RUNSTATUS_RUN;
+}
+
+// The update page needs the file lists of a release (filesystem.json, binaries.json), but GitHub serves
+// release assets without CORS headers, so the browser cannot read them. The AP fetches them instead.
+// Only release downloads from GitHub, and only small files: the lists are about 10 KB.
+#define GITHUB_PROXY_MAX_SIZE 65536
+
+struct GithubProxyJob {
+    String url;
+    AsyncWebServerRequestPtr request;
+};
+
+static volatile bool githubProxyBusy = false;
+
+static void githubProxyTask(void* parameter) {
+    GithubProxyJob* job = static_cast<GithubProxyJob*>(parameter);
+    int code = 502;
+    String body;
+
+    WiFiClientSecure client;
+    client.setInsecure();
+    HTTPClient http;
+    http.begin(client, job->url);
+    http.setReuse(false);
+    http.setTimeout(10000);
+    http.setFollowRedirects(HTTPC_FORCE_FOLLOW_REDIRECTS);
+    const int httpCode = http.GET();
+    char tlsError[100] = "";
+    if (httpCode < 0) client.lastError(tlsError, sizeof(tlsError));
+    if (httpCode == HTTP_CODE_OK) {
+        if (http.getSize() > GITHUB_PROXY_MAX_SIZE) {
+            body = "file too large";
+        } else {
+            body = http.getString();
+            if (body.length() == 0 || body.length() > GITHUB_PROXY_MAX_SIZE) {
+                body = "empty or too large response";
+            } else {
+                code = 200;
+            }
+        }
+    } else {
+        // always 502, also when GitHub says 404: to the page, a 404 means firmware without this endpoint
+        body = "GitHub: " + (httpCode < 0 ? http.errorToString(httpCode) + " " + tlsError : "HTTP " + String(httpCode));
+    }
+    http.end();
+
+    // the browser may have given up in the meantime: then the request no longer exists
+    if (auto request = job->request.lock()) {
+        request->send(code, code == 200 ? "application/json" : "text/plain", body);
+    }
+    delete job;
+    githubProxyBusy = false;
+    vTaskDelete(NULL);
+}
+
+void handleGithubProxy(AsyncWebServerRequest* request) {
+    if (!request->hasParam("url")) {
+        request->send(400, "text/plain", "url missing");
+        return;
+    }
+    const String url = request->getParam("url")->value();
+    if (!url.startsWith("https://github.com/") || url.indexOf("/releases/download/") < 0) {
+        request->send(403, "text/plain", "only release downloads from GitHub");
+        return;
+    }
+    if (githubProxyBusy) {
+        request->send(503, "text/plain", "busy");
+        return;
+    }
+    githubProxyBusy = true;
+    // the download takes seconds: it runs in its own task, the request is answered from there
+    GithubProxyJob* job = new GithubProxyJob{url, request->pause()};
+    // TLS handshake on the stack: see handleUpdateC6
+    if (xTaskCreate(githubProxyTask, "githubProxy", 10240, job, 2, NULL) != pdPASS) {
+        delete job;
+        githubProxyBusy = false;
+        request->send(503, "text/plain", "out of memory");
+    }
 }
 
 void handleRollback(AsyncWebServerRequest* request) {
@@ -335,16 +383,15 @@ void C6firmwareUpdateTask(void* parameter) {
     LOG("C6firmwareUpdateTask: url '%s'\n", urlPtr);
     wsSerial("Stopping AP service");
 
-    gSerialTaskState = SERIAL_STATE_STOP;
     config.runStatus = RUNSTATUS_STOP;
     setAPstate(false, AP_STATE_FLASHING);
+    stopApReader();
 #ifndef FLASHER_DEBUG_SHARED
-    extern bool rxSerialStopTask2;
+    extern volatile bool rxSerialStopTask2;
     rxSerialStopTask2 = true;
 #endif
     vTaskDelay(500 / portTICK_PERIOD_MS);
     Serial1.end();
-    setAPstate(false, AP_STATE_FLASHING);
 
     wsSerial(SHORT_CHIP_NAME " flash starting");
 
@@ -352,57 +399,44 @@ void C6firmwareUpdateTask(void* parameter) {
 
     wsSerial(SHORT_CHIP_NAME " flash end");
 
-    if (result) {
-        setAPstate(false, AP_STATE_OFFLINE);
+    // also after a failed update: the radio may still run its old firmware
+    setAPstate(false, AP_STATE_OFFLINE);
 
-        wsSerial("Finishing config...");
-        vTaskDelay(3000 / portTICK_PERIOD_MS);
+    wsSerial("Finishing config...");
+    vTaskDelay(3000 / portTICK_PERIOD_MS);
 
-        wsSerial("starting monitor");
-        Serial1.begin(115200, SERIAL_8N1, FLASHER_AP_RXD, FLASHER_AP_TXD);
+    wsSerial("starting monitor");
 #ifndef FLASHER_DEBUG_SHARED
-        rxSerialStopTask2 = false;
-        xTaskCreate(rxSerialTask2, "rxSerialTask2", 1850, NULL, 2, NULL);
+    rxSerialStopTask2 = false;
+    xTaskCreate(rxSerialTask2, "rxSerialTask2", 1850, NULL, 2, NULL);
 #endif
-        vTaskDelay(1000 / portTICK_PERIOD_MS);
+    vTaskDelay(1000 / portTICK_PERIOD_MS);
 
-        apInfo.version = 0;
-        wsSerial("bringing AP online");
-        // if (bringAPOnline(AP_STATE_REQUIRED_POWER_CYCLE)) config.runStatus = RUNSTATUS_STOP;
-        if (bringAPOnline(AP_STATE_ONLINE)) {
-            config.runStatus = RUNSTATUS_RUN;
-            setAPstate(true, AP_STATE_ONLINE);
-        }
-
-        // Wait for version info to arrive
-        vTaskDelay(500 / portTICK_PERIOD_MS);
-        if(apInfo.version == 0) {
-           result = false;
-        }
+    apInfo.version = 0;
+    wsSerial("bringing AP online");
+    if (bringAPOnline(AP_STATE_ONLINE)) {
+        config.runStatus = RUNSTATUS_RUN;
+        setAPstate(true, AP_STATE_ONLINE);
     }
 
-    if (result) {
-       wsSerial("Finished!");
-       char buffer[80];
-       snprintf(buffer, sizeof(buffer), "AP is now type %02X (%s), firmware version %04X",
-                apInfo.type, apTypeName(apInfo.type), apInfo.version);
-       wsSerial(String(buffer));
-    }
-    else if(apInfo.version == 0) {
-       wsSerial("AP failed to come online. :-(");
-    }
-    else {
-       wsSerial("Flashing failed. :-(");
+    // Wait for version info to arrive
+    vTaskDelay(500 / portTICK_PERIOD_MS);
+
+    char buffer[80];
+    if (apInfo.version == 0) {
+        wsSerial("The radio doesn't respond. :-( Try the update again.");
+    } else if (result) {
+        wsSerial("Finished!");
+        snprintf(buffer, sizeof(buffer), "AP is now type %02X (%s), firmware version %04X",
+                 apInfo.type, apTypeName(apInfo.type), apInfo.version);
+        wsSerial(String(buffer));
+    } else {
+        snprintf(buffer, sizeof(buffer), "Flashing failed. :-( The radio still runs firmware version %04X",
+                 apInfo.version);
+        wsSerial(String(buffer));
     }
     free(urlPtr);
 
-    if (result) {
-        wsSerial("[autoreboot]");
-        vTaskDelay(1500 / portTICK_PERIOD_MS);
-        ESP.restart();
-    }
-
-    wsSerial("[reboot]");
     vTaskDelay(30000 / portTICK_PERIOD_MS);
     vTaskDelete(NULL);
 }
@@ -414,7 +448,9 @@ void handleUpdateC6(AsyncWebServerRequest* request) {
     if (request->hasParam("url",true)) {
         const char* urlStr = request->getParam("url", true)->value().c_str();
         char* urlCopy = strdup(urlStr);
-        xTaskCreate(C6firmwareUpdateTask, "OTAUpdateTask", 6400, urlCopy, 10, NULL);
+        // The HTTPS download (TLS handshake) runs in this task: with 6400 bytes only 96 were left
+        // on the Yellow AP, and a Mini AP v4 (logging and USB CDC on) ran out of stack
+        xTaskCreate(C6firmwareUpdateTask, "OTAUpdateTask", 10240, urlCopy, 10, NULL);
         request->send(200, "Ok");
     }
     else {

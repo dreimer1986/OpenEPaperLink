@@ -15,10 +15,15 @@
 #include "AsyncJson.h"
 #include "LittleFS.h"
 #include "SPIFFSEditor.h"
+#include "ble_writer.h"
 #include "commstructs.h"
 #include "language.h"
 #include "leds.h"
 #include "newproto.h"
+#include "od_keys.h"
+#include "od_session.h"
+#include "pendingupload.h"
+#include "radioselftest.h"
 #include "ota.h"
 #include "serialap.h"
 #include "settings.h"
@@ -35,6 +40,13 @@
 
 AsyncWebServer server(80);
 AsyncWebSocket ws("/ws");
+
+// A restart asked for by a web request. The response is only sent once the handler returns, and the work before
+// the restart (saving the tag database, a factory reset) shouldn't run in async_tcp: handleRestartRequest() does it
+// in the loop task.
+enum class RestartRequest : uint8_t { None, Reboot, WifiConfig, FactoryReset };
+static volatile RestartRequest restartRequest = RestartRequest::None;
+
 WifiManager wm;
 
 SemaphoreHandle_t wsMutex;
@@ -95,6 +107,7 @@ void wsSendTouch(uint8_t count, const uint16_t *xs, const uint16_t *ys, const ui
 }
 
 size_t dbSize() {
+    TagDBLock lock;
     size_t size = tagDB.size() * sizeof(tagRecord);
     for (auto &tag : tagDB) {
         if (tag->data) {
@@ -110,21 +123,20 @@ void wsSendSysteminfo() {
     JsonObject sys = doc["sys"].to<JsonObject>();
     time_t now;
     time(&now);
-    static int freeSpaceLastRun = 0;
+    static int tagDBsizeLastRun = 0;
     static size_t tagDBsize = 0;
-    static uint64_t freeSpace = Storage.freeSpace();
 
     sys["currtime"] = now;
     sys["heap"] = ESP.getFreeHeap();
     sys["recordcount"] = tagDBsize;
     sys["dbsize"] = dbSize();
 
-    if (millis() - freeSpaceLastRun > 30000 || freeSpaceLastRun == 0) {
-        freeSpace = Storage.freeSpace();
+    if (millis() - tagDBsizeLastRun > 30000 || tagDBsizeLastRun == 0) {
         tagDBsize = tagDB.size();
-        freeSpaceLastRun = millis();
+        tagDBsizeLastRun = millis();
     }
-    sys["littlefsfree"] = freeSpace;
+    // measuring walks the whole file system: report the last measurement, minus what was reserved since
+    sys["littlefsfree"] = Storage.knownFreeSpace();
 
 #if BOARD_HAS_PSRAM
     sys["psfree"] = ESP.getFreePsram();
@@ -165,9 +177,18 @@ void wsSendSysteminfo() {
     setVarDB("ap_ch", String(apInfo.channel));
 #endif
 
-    // reboot once at night
+    // reboot once at night, or when the BLE task hangs: only a reboot gets it going again
+    const char* rebootReason = nullptr;
     if (timeinfo.tm_hour == 3 && timeinfo.tm_min == 56 && millis() > 2 * 3600 * 1000 && config.nightlyreboot == 1) {
-        logLine("Nightly reboot");
+        rebootReason = "Nightly reboot";
+    }
+#ifdef HAS_BLE_WRITER
+    else if (BLE_taskHung()) {
+        rebootReason = "BLE task hangs, reboot";
+    }
+#endif
+    if (rebootReason != nullptr) {
+        logLine(rebootReason);
         wsErr("REBOOTING");
         config.runStatus = RUNSTATUS_STOP;
         ws.enable(false);
@@ -238,6 +259,7 @@ void wsSendTaginfo(const uint8_t *mac, uint8_t syncMode) {
                     taginfoitem.wakeupReason = taginfo->wakeupReason;
                     taginfoitem.capabilities = taginfo->capabilities;
                     taginfoitem.pendingIdle = taginfo->pendingIdle;
+                    memcpy(taginfoitem.md5, taginfo->md5, sizeof(taginfoitem.md5));
                 }
                 udpsync.netTaginfo(&taginfoitem);
             }
@@ -257,6 +279,7 @@ void wsSendAPitem(struct APlist *apitem) {
     ap["count"] = apitem->tagCount;
     ap["channel"] = apitem->channelId;
     ap["version"] = version_str;
+    ap["udp"] = apitem->udpVersion;
 
     if (wsMutex) xSemaphoreTake(wsMutex, portMAX_DELAY);
     ws.textAll(doc.as<String>());
@@ -281,6 +304,11 @@ uint8_t wsClientCount() {
     return ws.count();
 }
 
+// Empty means an open hotspot; WPA2 takes 8 to 63 characters
+static bool validHotspotPassword(const String &pw) {
+    return pw.length() == 0 || (pw.length() >= 8 && pw.length() <= 63);
+}
+
 void init_web() {
     wsMutex = xSemaphoreCreateMutex();
     WiFi.mode(WIFI_STA);
@@ -294,15 +322,7 @@ void init_web() {
 
     server.on("/reboot", HTTP_POST, [](AsyncWebServerRequest *request) {
         request->send(200, "text/plain", "OK Reboot");
-        logLine("Reboot request by user");
-        wsErr("REBOOTING");
-        delay(100);
-        ws.enable(false);
-        refreshAllPending();
-        saveDB("/current/tagDB.json");
-        ws.closeAll();
-        delay(100);
-        ESP.restart();
+        restartRequest = RestartRequest::Reboot;
     });
 
     server.serveStatic("/current", *contentFS, "/current/").setCacheControl("max-age=604800");
@@ -310,7 +330,7 @@ void init_web() {
 
     server.on(
         "/imgupload", HTTP_POST, [](AsyncWebServerRequest *request) {
-            request->send(200);
+            if (!request->getResponse()) request->send(200);  // keep the response set by the upload handler
         },
         doImageUpload);
     server.on("/jsonupload", HTTP_POST, doJsonUpload);
@@ -351,16 +371,9 @@ void init_web() {
                                 request->send(404, "text/plain", "File not found");
                                 return;
                             }
-                            if (queueItem->data == nullptr) {
-                                fs::File file = contentFS->open(queueItem->filename);
-                                if (file) {
-                                    queueItem->data = getDataForFile(file);
-                                    Serial.println("Reading file " + String(queueItem->filename));
-                                    file.close();
-                                } else {
-                                    request->send(404, "text/plain", "File not found");
-                                    return;
-                                }
+                            if (!loadQueueItemData(queueItem)) {
+                                request->send(404, "text/plain", "File not found");
+                                return;
                             }
                             request->send(200, "application/octet-stream", queueItem->data, queueItem->len);
                             return;
@@ -427,6 +440,55 @@ void init_web() {
         request->send(200, "text/plain", "Ok, saved");
     });
 
+#ifdef HAS_BLE_WRITER
+    // OpenDisplay tag, added by the user with or without an encryption key: GET says whether it
+    // is added and has a key (never the key itself); POST sets the key (32 hex digits), adds the
+    // tag without one (add=1) or removes either (empty key)
+    server.on("/od_key", HTTP_ANY, [](AsyncWebServerRequest *request) {
+        const bool post = request->method() == HTTP_POST;
+        uint8_t mac[8];
+        if (!request->hasParam("mac", post) || !hex2mac(request->getParam("mac", post)->value(), mac) ||
+            bleFamily(mac, 0) != BLE_FAMILY_OPENDISPLAY) {
+            request->send(400, "text/plain", "Not an OpenDisplay tag");
+            return;
+        }
+        if (!post) {
+            const bool set = odKeyHas(mac);
+            request->send(200, "application/json", String("{\"set\":") + (set ? "true" : "false") + ",\"added\":" + (set || odKeyAdded(mac) ? "true" : "false") + "}");
+            return;
+        }
+        if (request->hasParam("add", true)) {
+            const bool added = odKeyAddWithoutKey(mac);
+            odKeyChanged(mac);
+            wsSendTaginfo(mac, SYNC_NOSYNC);
+            request->send(200, "text/plain", added ? "Tag added without a key" : "Error adding the tag");
+            return;
+        }
+        const String hex = request->hasParam("key", true) ? request->getParam("key", true)->value() : "";
+        if (hex.isEmpty()) {
+            odKeyClear(mac);
+            odForget(mac);
+            wsSendTaginfo(mac, SYNC_NOSYNC);  // this AP's view only, the tag may be on another AP
+            request->send(200, "text/plain", "Removed: the AP no longer connects to this tag");
+            return;
+        }
+        uint8_t key[16];
+        bool valid = hex.length() == 32;
+        for (int i = 0; valid && i < 32; i++) valid = isxdigit(hex[i]);
+        if (valid) {
+            for (int i = 0; i < 16; i++) key[i] = strtoul(hex.substring(i * 2, i * 2 + 2).c_str(), nullptr, 16);
+        } else {
+            request->send(400, "text/plain", "The key is 32 hex digits");
+            return;
+        }
+        const bool saved = odKeySet(mac, key);
+        memset(key, 0, sizeof(key));
+        odKeyChanged(mac);
+        wsSendTaginfo(mac, SYNC_NOSYNC);
+        request->send(200, "text/plain", saved ? "Key saved" : "Error saving the key");
+    });
+#endif
+
     server.on("/tag_cmd", HTTP_POST, [](AsyncWebServerRequest *request) {
         if (request->hasParam("mac", true) && request->hasParam("cmd", true)) {
             uint8_t mac[8];
@@ -441,8 +503,7 @@ void init_web() {
                     if (strcmp(cmdValue, "purge") == 0) {
                         time_t now;
                         time(&now);
-                        for (int c = tagDB.size() - 1; c >= 0; --c) {
-                            tagRecord *tag = tagDB.at(c);
+                        for (tagRecord *tag : tagDBSnapshot()) {
                             if (tag->expectedNextCheckin == 3216153600 || tag->lastseen < now - 24 * 3600 || now > tag->expectedNextCheckin + 600) {
                                 wsSendTaginfo(tag->mac, SYNC_DELETE);
                                 deleteRecord(tag->mac);
@@ -451,8 +512,7 @@ void init_web() {
                     }
                     if (strcmp(cmdValue, "clear") == 0) {
                         clearPending(taginfo);
-                        while (dequeueItem(mac)) {
-                        };
+                        dequeueAllItems(mac);
                         taginfo->pendingCount = countQueueItem(mac);
                         wsSendTaginfo(mac, SYNC_TAGSTATUS);
                     }
@@ -597,6 +657,17 @@ void init_web() {
         response->print("\"hasSubGhz\": \"0\", ");
 #endif
 
+        {
+            Preferences preferences;
+            preferences.begin("wifi", true);
+            JsonDocument pw;
+            pw.set(preferences.getString("appw", ""));
+            preferences.end();
+            response->print("\"hotspotpw\": ");
+            serializeJson(pw, *response);
+            response->print(", ");
+        }
+
         response->print("\"apstate\": \"" + String(apInfo.state) + "\"");
 
         File configFile = contentFS->open("/current/apconfig.json", "r");
@@ -618,6 +689,17 @@ void init_web() {
     });
 
     server.on("/save_apcfg", HTTP_POST, [](AsyncWebServerRequest *request) {
+        if (request->hasParam("hotspotpw", true)) {
+            const String pw = request->getParam("hotspotpw", true)->value();
+            if (!validHotspotPassword(pw)) {
+                request->send(400, "text/plain", "Hotspot password needs 8 to 63 characters");
+                return;
+            }
+            Preferences preferences;
+            preferences.begin("wifi", false);
+            preferences.putString("appw", pw);
+            preferences.end();
+        }
         if (request->hasParam("alias", true)) {
             String aliasValue = request->getParam("alias", true)->value();
             size_t aliasLength = aliasValue.length();
@@ -785,6 +867,8 @@ void init_web() {
         for (size_t i = 0; i < numKeys; i++) {
             doc[keys[i]] = preferences.getString(keys[i], "");
         }
+        doc["appw"] = preferences.getString("appw", "");
+        doc["apfallback"] = preferences.getUChar("apfallback", 1);
         doc["mac"] = WiFi.macAddress();
         serializeJson(doc, *response);
         request->send(response);
@@ -818,9 +902,13 @@ void init_web() {
 
     AsyncCallbackJsonWebHandler *handler = new AsyncCallbackJsonWebHandler("/save_wifi_config", [](AsyncWebServerRequest *request, JsonVariant &json) {
         const JsonObject &jsonObj = json.as<JsonObject>();
+        if (jsonObj["appw"].is<String>() && !validHotspotPassword(jsonObj["appw"].as<String>())) {
+            request->send(400, "text/plain", "Hotspot password needs 8 to 63 characters");
+            return;
+        }
         Preferences preferences;
         preferences.begin("wifi", false);
-        const char *keys[] = {"ssid", "pw", "ip", "mask", "gw", "dns"};
+        const char *keys[] = {"ssid", "pw", "ip", "mask", "gw", "dns", "appw"};
         const size_t numKeys = sizeof(keys) / sizeof(keys[0]);
         for (size_t i = 0; i < numKeys; i++) {
             String key = keys[i];
@@ -828,44 +916,13 @@ void init_web() {
                 preferences.putString(key.c_str(), jsonObj[key].as<String>());
             }
         }
+        if (jsonObj["apfallback"].is<int>()) {
+            preferences.putUChar("apfallback", jsonObj["apfallback"].as<int>() ? 1 : 0);
+        }
         preferences.end();
         Serial.println("config saved");
         request->send(200, "text/plain", "Ok, saved");
-
-        ws.enable(false);
-
-        if (jsonObj["ssid"].as<String>() == "factory") {
-            config.runStatus = RUNSTATUS_STOP;
-            vTaskDelay(2000 / portTICK_PERIOD_MS);
-            preferences.begin("wifi", false);
-            preferences.putString("ssid", "");
-            preferences.putString("pw", "");
-            preferences.end();
-            destroyDB();
-            cleanupCurrent();
-            contentFS->remove("/AP_FW_Pack.bin");
-            contentFS->remove("/OpenEPaperLink_esp32_C6.bin");
-            contentFS->remove("/OpenEPaperLink_esp32_C6uart0.bin");
-            contentFS->remove("/bootloader.bin");
-            contentFS->remove("/partition-table.bin");
-            contentFS->remove("/update_actions.json");
-            contentFS->remove("/log.txt");
-            contentFS->remove("/logold.txt");
-            contentFS->remove("/current/tagDB.json");
-            contentFS->remove("/current/tagDB.json.bak");
-            contentFS->remove("/current/tagDBrestored.json");
-            contentFS->remove("/current/apconfig.json");
-            delay(100);
-            esp_deep_sleep_start();
-            ESP.restart();
-        } else {
-            refreshAllPending();
-            saveDB("/current/tagDB.json");
-        }
-
-        ws.closeAll();
-        delay(100);
-        ESP.restart();
+        restartRequest = jsonObj["ssid"].as<String>() == "factory" ? RestartRequest::FactoryReset : RestartRequest::WifiConfig;
     });
     server.addHandler(handler);
 
@@ -877,16 +934,63 @@ void init_web() {
     });
     server.on(
         "/restore_db", HTTP_POST, [](AsyncWebServerRequest *request) {
-            request->send(200);
+            if (!request->getResponse()) request->send(200);  // keep the response set by the upload handler
         },
         dotagDBUpload);
 
     // OTA related calls
 
     server.on("/sysinfo", HTTP_GET, handleSysinfoRequest);
+    // core dump of the last crash, for: espcoredump.py info_corefile -t raw -c coredump.bin firmware.elf
+    server.on("/coredump", HTTP_GET, [](AsyncWebServerRequest *request) {
+        const size_t size = coreDumpSize();
+        if (size == 0) {
+            request->send(404, "text/plain", "No core dump");
+            return;
+        }
+        AsyncWebServerResponse *response = request->beginResponse("application/octet-stream", size, [](uint8_t *buffer, size_t maxLen, size_t index) -> size_t {
+            return readCoreDump(buffer, index, maxLen);
+        });
+        response->addHeader("Content-Disposition", "attachment; filename=\"coredump.bin\"");
+        request->send(response);
+    });
+    server.on("/coredump_erase", HTTP_POST, [](AsyncWebServerRequest *request) {
+        const bool erased = eraseCoreDump();
+        request->send(erased ? 200 : 500, "text/plain", erased ? "OK" : "Failed");
+    });
     server.on("/check_file", HTTP_GET, handleCheckFile);
+    server.on("/github_proxy", HTTP_GET, handleGithubProxy);
     server.on("/rollback", HTTP_POST, handleRollback);
     server.on("/update_c6", HTTP_POST, handleUpdateC6);
+    /* Radio wiring self-test (task #32). POST starts it (the radio is offline
+       for 5-10 s), GET returns the last result. For development, protoTx,
+       protoRx, dbgTx, dbgRx, reset and prog (S3-side GPIOs, -2 = not
+       connected) replace the configured pins, to simulate wiring faults on a
+       correctly wired AP. */
+    server.on("/radio_selftest", HTTP_GET, [](AsyncWebServerRequest *request) {
+        request->send(200, "application/json", radioSelfTestResult());
+    });
+    server.on("/radio_selftest", HTTP_POST, [](AsyncWebServerRequest *request) {
+        RadioPins pins = radioPinsFromConfig();
+        struct { const char *name; int8_t *pin; } params[] = {
+            {"protoTx", &pins.protoTx}, {"protoRx", &pins.protoRx}, {"dbgTx", &pins.dbgTx},
+            {"dbgRx", &pins.dbgRx}, {"reset", &pins.reset}, {"prog", &pins.prog},
+        };
+        for (auto &p : params) {
+            if (!request->hasParam(p.name, true)) continue;
+            long v = request->getParam(p.name, true)->value().toInt();
+            if (v < -2 || v > 48) {  // -2: simulate a wire that is not connected
+                request->send(400, "text/plain", String("invalid pin for ") + p.name);
+                return;
+            }
+            *p.pin = (int8_t)v;
+        }
+        if (startRadioSelfTest(pins)) {
+            request->send(202, "text/plain", "started");
+        } else {
+            request->send(409, "text/plain", "not possible now (test or flashing running, or no ESP radio)");
+        }
+    });
 #ifdef FLASHER_AP_SWS
     /* Flash the TLSR over SWS. Defaults to the firmware already on the
        filesystem; "url" fetches a release directory instead. */
@@ -909,7 +1013,7 @@ void init_web() {
     });
     server.on(
         "/littlefs_put", HTTP_POST, [](AsyncWebServerRequest *request) {
-            request->send(200);
+            if (!request->getResponse()) request->send(200);  // keep the response set by the upload handler
         },
         handleLittleFSUpload);
 
@@ -938,132 +1042,182 @@ void init_web() {
     server.begin();
 }
 
-#define UPLOAD_BUFFER_SIZE 32768
-
-struct UploadInfo {
-    String filename;
-    uint8_t buffer[UPLOAD_BUFFER_SIZE];
-    size_t bufferSize;
+/// @brief State of an /imgupload while it is received, in AsyncWebServerRequest::_tempObject
+/// @note Allocated with malloc(), because the web server releases _tempObject with free() when a request is aborted
+struct ImageUpload {
+    uint8_t mac[8];
+    char name[48];
+    uint8_t *data;  // PSRAM, see pendingupload.h
+    size_t size;
+    size_t len;
+    bool overflow;
 };
 
+void handleRestartRequest() {
+    switch (restartRequest) {
+        case RestartRequest::None:
+            return;
+        case RestartRequest::Reboot:
+            logLine("Reboot request by user");
+            wsErr("REBOOTING");
+            delay(100);
+            ws.enable(false);
+            refreshAllPending();
+            saveDB("/current/tagDB.json");
+            break;
+        case RestartRequest::WifiConfig:
+            ws.enable(false);
+            refreshAllPending();
+            saveDB("/current/tagDB.json");
+            break;
+        case RestartRequest::FactoryReset: {
+            ws.enable(false);
+            config.runStatus = RUNSTATUS_STOP;
+            vTaskDelay(2000 / portTICK_PERIOD_MS);
+            Preferences preferences;
+            preferences.begin("wifi", false);
+            preferences.putString("ssid", "");
+            preferences.putString("pw", "");
+            preferences.end();
+            destroyDB();
+            cleanupCurrent();
+            contentFS->remove("/AP_FW_Pack.bin");
+            contentFS->remove("/OpenEPaperLink_esp32_C6.bin");
+            contentFS->remove("/OpenEPaperLink_esp32_C6uart0.bin");
+            contentFS->remove("/bootloader.bin");
+            contentFS->remove("/partition-table.bin");
+            contentFS->remove("/update_actions.json");
+            contentFS->remove("/log.txt");
+            contentFS->remove("/logold.txt");
+            contentFS->remove("/current/tagDB.json");
+            contentFS->remove("/current/tagDB.json.bak");
+            contentFS->remove("/current/tagDBrestored.json");
+            contentFS->remove("/current/apconfig.json");
+            delay(100);
+            esp_deep_sleep_start();
+            break;
+        }
+    }
+    ws.closeAll();
+    delay(100);
+    ESP.restart();
+}
+
 void doImageUpload(AsyncWebServerRequest *request, String filename, size_t index, uint8_t *data, size_t len, bool final) {
-    String uploadfilename;
     if (!index) {
         if (config.runStatus != RUNSTATUS_RUN) {
             request->send(409, "text/plain", "Come back later");
             return;
         }
-        if (!request->hasParam("mac", true)) {
+        uint8_t mac[8];
+        if (!request->hasParam("mac", true) || !hex2mac(request->getParam("mac", true)->value(), mac)) {
             request->send(400, "text/plain", "parameters incomplete");
             return;
         }
-        logLine("http imageUpload " + uploadfilename);
-
-        uploadfilename = request->getParam("mac", true)->value() + "_" + String(millis()) + ".jpg";
-        File file = contentFS->open("/temp/" + uploadfilename, "w");
-        file.close();
-        Serial.println("upload started " + uploadfilename);
-
-        UploadInfo *uploadInfo = new UploadInfo{uploadfilename, {}, 0};
-        request->_tempObject = (void *)uploadInfo;
-    }
-
-    UploadInfo *uploadInfo = static_cast<UploadInfo *>(request->_tempObject);
-
-    if (uploadInfo != nullptr) {
-        uploadfilename = uploadInfo->filename;
-
-        if (len) {
-            if (uploadInfo->bufferSize + len <= UPLOAD_BUFFER_SIZE) {
-                memcpy(&uploadInfo->buffer[uploadInfo->bufferSize], data, len);
-                uploadInfo->bufferSize += len;
-            } else {
-                xSemaphoreTake(fsMutex, portMAX_DELAY);
-                File file = contentFS->open("/temp/" + uploadfilename, "a");
-                if (file) {
-                    file.write(uploadInfo->buffer, uploadInfo->bufferSize);
-                    file.close();
-                    uploadInfo->bufferSize = 0;
-                    xSemaphoreGive(fsMutex);
-                } else {
-                    xSemaphoreGive(fsMutex);
-                    logLine("Failed to open file for appending: " + uploadfilename);
-                }
-
-                memcpy(uploadInfo->buffer, data, len);
-                uploadInfo->bufferSize = len;
-            }
+        const size_t size = request->contentLength();
+        if (size == 0) {
+            request->send(411, "text/plain", "Content-Length required");
+            return;
+        }
+        if (size > IMAGE_UPLOAD_MAX_SIZE) {
+            request->send(413, "text/plain", "Image too large");
+            return;
         }
 
-        if (final) {
-            if (uploadInfo->bufferSize > 0) {
-                xSemaphoreTake(fsMutex, portMAX_DELAY);
-                File file = contentFS->open("/temp/" + uploadfilename, "a");
-                if (file) {
-                    file.write(uploadInfo->buffer, uploadInfo->bufferSize);
-                    file.close();
-                    xSemaphoreGive(fsMutex);
-                } else {
-                    xSemaphoreGive(fsMutex);
-                    logLine("Failed to open file for appending: " + uploadfilename);
-                }
-                request->_tempObject = nullptr;
-                delete uploadInfo;
-            }
+        const String name = "/temp/" + request->getParam("mac", true)->value() + "_" + String(millis()) + ".jpg";
+        logLine("http imageUpload " + name);
 
-            if (request->hasParam("mac", true)) {
-                String dst = request->getParam("mac", true)->value();
-                uint8_t mac[8];
-                if (hex2mac(dst, mac)) {
-                    tagRecord *taginfo = tagRecord::findByMAC(mac);
-                    if (taginfo != nullptr) {
-                        uint8_t dither = 1;
-                        if (request->hasParam("dither", true)) {
-                            dither = request->getParam("dither", true)->value().toInt();
-                        }
-                        if (request->hasParam("alias", true)) {
-                            taginfo->alias = request->getParam("alias", true)->value();
-                        }
-                        if (request->hasParam("rotate", true)) {
-                            taginfo->rotate = atoi(request->getParam("rotate", true)->value().c_str());
-                        }
-                        if (request->hasParam("lut", true)) {
-                            taginfo->lut = atoi(request->getParam("lut", true)->value().c_str());
-                        }
-                        if (request->hasParam("invert", true)) {
-                            taginfo->invert = atoi(request->getParam("invert", true)->value().c_str());
-                        }
-                        uint32_t ttl = 0;
-                        if (request->hasParam("ttl", true)) {
-                            ttl = request->getParam("ttl", true)->value().toInt();
-                        }
-                        uint8_t preload = 0;
-                        uint8_t preloadlut = 0;
-                        uint8_t preloadtype = 0;
-                        if (request->hasParam("preloadtype", true)) {
-                            preload = 1;
-                            preloadtype = request->getParam("preloadtype", true)->value().toInt();
-                            if (request->hasParam("preloadlut", true)) {
-                                preloadlut = request->getParam("preloadlut", true)->value().toInt();
-                            }
-                        }
-                        taginfo->modeConfigJson = "{\"filename\":\"/temp/" + uploadfilename + "\",\"timetolive\":\"" + String(ttl) + "\",\"dither\":\"" + String(dither) + "\",\"delete\":\"1\", \"preload\":\"" + String(preload) + "\", \"preload_lut\":\"" + String(preloadlut) + "\", \"preload_type\":\"" + String(preloadtype) + "\"}";
-                        if (request->hasParam("contentmode", true)) {
-                            taginfo->contentMode = request->getParam("contentmode", true)->value().toInt();
-                        } else {
-                            taginfo->contentMode = 24;
-                        }
-                        Serial.println("upload finished " + uploadfilename);
-                        taginfo->nextupdate = 0;
-                        wsSendTaginfo(mac, SYNC_USERCFG);
-                        request->send(200, "text/plain", "Ok, saved");
-                    } else {
-                        request->send(400, "text/plain", "mac not found");
-                    }
-                }
-            }
+        ImageUpload *upload = static_cast<ImageUpload *>(malloc(sizeof(ImageUpload)));
+        uint8_t *buffer = upload != nullptr ? allocUploadBuffer(size) : nullptr;
+        if (buffer == nullptr) {
+            free(upload);
+            AsyncWebServerResponse *response = request->beginResponse(409, "text/plain", "Busy, come back later");
+            response->addHeader("Retry-After", "5");
+            request->send(response);
+            return;
+        }
+        memcpy(upload->mac, mac, sizeof(mac));
+        strlcpy(upload->name, name.c_str(), sizeof(upload->name));
+        upload->data = buffer;
+        upload->size = size;
+        upload->len = 0;
+        upload->overflow = false;
+        request->_tempObject = upload;
+        request->onDisconnect([request]() {
+            // aborted before the end: the buffer isn't stored, so free it (the server frees _tempObject)
+            const ImageUpload *upload = static_cast<const ImageUpload *>(request->_tempObject);
+            if (upload != nullptr) freeUploadBuffer(upload->data, upload->size);
+        });
+    }
+
+    ImageUpload *upload = static_cast<ImageUpload *>(request->_tempObject);
+    if (upload == nullptr) return;
+
+    if (upload->len + len > upload->size) {
+        upload->overflow = true;
+    } else if (len) {
+        memcpy(upload->data + upload->len, data, len);
+        upload->len += len;
+    }
+    if (!final) return;
+
+    request->_tempObject = nullptr;
+    const ImageUpload received = *upload;
+    free(upload);
+
+    tagRecord *taginfo = received.overflow ? nullptr : tagRecord::findByMAC(received.mac);
+    if (taginfo == nullptr) {
+        freeUploadBuffer(received.data, received.size);
+        request->send(400, "text/plain", received.overflow ? "upload larger than its content length" : "mac not found");
+        return;
+    }
+    const String uploadfilename = received.name;
+
+    uint8_t dither = 1;
+    if (request->hasParam("dither", true)) {
+        dither = request->getParam("dither", true)->value().toInt();
+    }
+    if (request->hasParam("alias", true)) {
+        taginfo->alias = request->getParam("alias", true)->value();
+    }
+    if (request->hasParam("rotate", true)) {
+        taginfo->rotate = atoi(request->getParam("rotate", true)->value().c_str());
+    }
+    if (request->hasParam("lut", true)) {
+        taginfo->lut = atoi(request->getParam("lut", true)->value().c_str());
+    }
+    if (request->hasParam("invert", true)) {
+        taginfo->invert = atoi(request->getParam("invert", true)->value().c_str());
+    }
+    uint32_t ttl = 0;
+    if (request->hasParam("ttl", true)) {
+        ttl = request->getParam("ttl", true)->value().toInt();
+    }
+    uint8_t preload = 0;
+    uint8_t preloadlut = 0;
+    uint8_t preloadtype = 0;
+    if (request->hasParam("preloadtype", true)) {
+        preload = 1;
+        preloadtype = request->getParam("preloadtype", true)->value().toInt();
+        if (request->hasParam("preloadlut", true)) {
+            preloadlut = request->getParam("preloadlut", true)->value().toInt();
         }
     }
+    {
+        // the stored image and the config that names it change together (see dropStalePendingUploads)
+        std::lock_guard<std::recursive_mutex> lock(pendingUploadMutex());
+        storePendingUpload(received.mac, uploadfilename, received.data, received.len, received.size);
+        taginfo->modeConfigJson = "{\"filename\":\"" + uploadfilename + "\",\"timetolive\":\"" + String(ttl) + "\",\"dither\":\"" + String(dither) + "\",\"delete\":\"1\", \"preload\":\"" + String(preload) + "\", \"preload_lut\":\"" + String(preloadlut) + "\", \"preload_type\":\"" + String(preloadtype) + "\"}";
+        if (request->hasParam("contentmode", true)) {
+            taginfo->contentMode = request->getParam("contentmode", true)->value().toInt();
+        } else {
+            taginfo->contentMode = 24;
+        }
+        taginfo->nextupdate = 0;
+    }
+    Serial.println("upload finished " + uploadfilename);
+    wsSendTaginfo(received.mac, SYNC_USERCFG);
+    request->send(200, "text/plain", "Ok, saved");
 }
 
 void doJsonUpload(AsyncWebServerRequest *request) {
@@ -1106,15 +1260,24 @@ void doJsonUpload(AsyncWebServerRequest *request) {
 }
 
 void dotagDBUpload(AsyncWebServerRequest *request, String filename, size_t index, uint8_t *data, size_t len, bool final) {
+    // fsMutex is only held per chunk: an aborted upload would otherwise never release it
     if (!index) {
         logLine("restore tagDB");
         xSemaphoreTake(fsMutex, portMAX_DELAY);
         request->_tempFile = contentFS->open("/current/tagDBrestored.json", "w");
+        xSemaphoreGive(fsMutex);
+    }
+    if (!request->_tempFile) {
+        if (final) request->send(507, "text/plain", "Error writing file");
+        return;
     }
     if (len) {
+        xSemaphoreTake(fsMutex, portMAX_DELAY);
         request->_tempFile.write(data, len);
+        xSemaphoreGive(fsMutex);
     }
     if (final) {
+        xSemaphoreTake(fsMutex, portMAX_DELAY);
         request->_tempFile.close();
         xSemaphoreGive(fsMutex);
         destroyDB();

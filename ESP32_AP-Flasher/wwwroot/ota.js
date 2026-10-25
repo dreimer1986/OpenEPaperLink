@@ -20,8 +20,44 @@ let gCurrentRfVer = 0;
 // firmwares that are not interchangeable and each gets its own entry.
 let gTargets = [];
 
+// GitHub release assets carry no CORS headers, so the browser cannot read the
+// firmware json from the release. The release workflow copies it from the repo
+// at the tag, and raw.githubusercontent.com does allow cross-origin reads.
+const radioFwTimeout = 5000;
+let gRadioFwVersionFailed = false;
+
+// The file lists of a release are only release assets: the AP fetches those for the page.
+// Firmware from before github_proxy answers 404. It is still updated through the external
+// proxy, and also gets its firmware from there: it downloads over http only.
+let gLegacyProxy = false;
+
+async function fetchReleaseFile(url) {
+    if (!gLegacyProxy) {
+        const response = await fetch('github_proxy?url=' + encodeURIComponent(url));
+        if (response.status != 404) return response;
+        gLegacyProxy = true;
+        print("This firmware cannot fetch release files itself yet, using openepaperlink.eu", "yellow");
+    }
+    return fetch("//openepaperlink.eu/getupdate/?url=" + url);
+}
+
+async function fetchRadioFwVersion(tag, jsonName) {
+    const url = `https://raw.githubusercontent.com/${repo}/${tag}/binaries/${gBinDir}/${jsonName}`;
+    try {
+        const response = await fetch(url, { signal: AbortSignal.timeout(radioFwTimeout) });
+        if (!response.ok) throw new Error('HTTP ' + response.status);
+        const files = await response.json();
+        return files[2]['version'];
+    } catch (error) {
+        console.log(`Radio firmware version from ${url} failed: ${error}`);
+        gRadioFwVersionFailed = true;
+        return null;
+    }
+}
+
 export async function initUpdate() {
     gTargets = [];
+    gRadioFwVersionFailed = false;
     initFlashPins();
     if (apConfig?.H2 && apConfig.H2 == 1) {
         gIsH2 = true;
@@ -116,6 +152,7 @@ export async function initUpdate() {
         // firmware behind /flash_tlsr is not even compiled in on such a
         // board, so pressing it could only ever fail.
         if (sdata.has_sws_flasher) $("#flashTlsrOption").style.display = 'block';
+        if (sdata.hasC6 || sdata.hasH2) $("#radioTestOption").style.display = 'block';
         $('#environment').value = env;
     }
 
@@ -146,7 +183,7 @@ export async function initUpdate() {
     } else {
         const release = releaseDetails[0];
         if (release?.tag_name) {
-            if (release.tag_name == currentVer) {
+            if (sameVersion(release.tag_name, currentVer)) {
                 easyupdate.innerHTML = `Version ${currentVer}. You are up to date`;
             } else if (release.date < formatEpoch(currentBuildtime - 30 * 60)) {
                 easyupdate.innerHTML = `Your version is newer than the latest release date.<br>Are you the developer? :-)`;
@@ -167,7 +204,7 @@ export async function initUpdate() {
         if (rowCounter < 4 && release?.html_url) {
             const tableRow = document.createElement('tr');
             let tablerow = `<td><a href="${release.html_url}" target="_new">${release.tag_name}</a></td><td>${release.date}</td><td>${release.name}</td><td><button type="button" onclick="otamodule.updateESP('${release.bin_url}', true)">ESP32</button></td><td><button type="button" onclick="otamodule.updateWebpage('${release.file_url}','${release.tag_name}', true)">Filesystem</button></td>`;
-            if (release.tag_name == currentVer) {
+            if (sameVersion(release.tag_name, currentVer)) {
                 tablerow += "<td>current version</td>";
             } else if (release.date < formatEpoch(currentBuildtime)) {
                 tablerow += "<td>older</td>";
@@ -202,15 +239,7 @@ export async function initUpdate() {
 
                 tablerow = `<td><a href="${release.html_url}" target="_new">${release.tag_name}</a></td><td>${release.date}</td><td>${release.name}</td>`;
                 tablerow += `<td><button type="button" onclick="otamodule.updateC6H2('${release_url}')">${gModuleType}</button></td>`;
-                const firmwareUrl = 'http://proxy.openepaperlink.org/proxy.php?url=' + release.firmware_url;
-                firmwareVer = await fetch(firmwareUrl, { method: 'GET' })
-                    .then(function (response) { return response.json(); })
-                    .then(function (response) {
-                        return response[2]['version'];
-                    })
-                    .catch(error => {
-                        print('Error fetching releases:' + error, "red");
-                    });
+                firmwareVer = await fetchRadioFwVersion(release.tag_name, JsonName) ?? 'unknown';
                 tablerow += '<td>' + firmwareVer + '</td><td>';
                 if (firmwareVer != 'unknown') {
                     let Ver = Number('0x' + firmwareVer);
@@ -233,6 +262,9 @@ export async function initUpdate() {
 
         $('#radio_releasetable').innerHTML = "";
         $('#radio_releasetable').appendChild(table1);
+        if (gRadioFwVersionFailed) {
+            print(`Could not read the ${gModuleType} firmware version of one or more releases\nfrom raw.githubusercontent.com. Updating still works, only the\nVersion column shows 'unknown'.`, "yellow");
+        }
     }
 
     const table2 = document.createElement('table');
@@ -277,119 +309,112 @@ export async function initUpdate() {
     disableButtons(buttonState);
 }
 
-export function updateAll(binUrl, fileUrl, tagname) {
-    updateWebpage(fileUrl, tagname, false)
-        .then(() => {
-            fetchAndCheckTagtypes(true);
-        })
-        .then(() => {
-            updateESP(binUrl, false);
-        })
-        .catch(error => {
-            console.error(error);
-        });
+export async function updateAll(binUrl, fileUrl, tagname) {
+    if (running) return;
+    if (!confirm("Confirm updating the esp32 and filesystem")) return;
+
+    // Each step waits for the previous one. The firmware is only flashed when
+    // the file system is complete: new firmware with half of its files missing
+    // is worse than staying on the old version. A retry is cheap, files that
+    // are already up to date are skipped.
+    if (!await updateWebpage(fileUrl, tagname, false)) {
+        print("The firmware was not updated. Press 'Update now!' again to retry.", "red");
+        return;
+    }
+    // update the tagtypes, but delete nothing: cleaning up is a choice on the tagtype button
+    await fetchAndCheckTagtypes(false);
+    await updateESP(binUrl, false);
 }
 
+// Returns true when every file is up to date. Never throws: whatever goes
+// wrong is printed, and the buttons are always enabled again afterwards.
 export async function updateWebpage(fileUrl, tagname, showReload) {
-    return new Promise((resolve, reject) => {
-        (async function () {
+    if (running) return false;
+    if (showReload && !confirm("Confirm updating the filesystem")) return false;
+
+    disableButtons(true);
+    running = true;
+    errors = 0;
+    const consoleDiv = document.getElementById('updateconsole');
+    consoleDiv.scrollTop = consoleDiv.scrollHeight;
+
+    try {
+        print("Updating littleFS partition...");
+
+        let files;
+        try {
+            const response = await fetchReleaseFile(fileUrl);
+            if (!response.ok) throw new Error("HTTP " + response.status);
+            files = await response.json();
+            if (!Array.isArray(files)) throw new Error("unexpected response");
+        } catch (error) {
+            print("Error fetching the list of files: " + error.message, "red");
+            errors++;
+            return false;
+        }
+
+        const updateactions = files.find(file => file.name === "update_actions.json");
+        if (updateactions) {
+            await fetchAndPost(updateactions.url, updateactions.name, updateactions.path);
             try {
-                if (running) return;
-                if (showReload) {
-                    if (!confirm("Confirm updating the filesystem")) return;
+                const response = await fetch("update_actions", {
+                    method: "POST",
+                    body: ''
+                });
+                if (response.ok) {
+                    await response.text();
                 } else {
-                    if (!confirm("Confirm updating the esp32 and filesystem")) return;
+                    print(`error performing update actions: ${response.status}`, "red");
+                    errors++;
                 }
-
-                disableButtons(true);
-                running = true;
-                errors = 0;
-                const consoleDiv = document.getElementById('updateconsole');
-                consoleDiv.scrollTop = consoleDiv.scrollHeight;
-
-                print("Updating littleFS partition...");
-
-                fetch("//openepaperlink.eu/getupdate/?url=" + fileUrl)
-                    .then(response => response.json())
-                    .then(data => {
-                        checkfiles(data);
-                    })
-                    .catch(error => {
-                        print('Error fetching data:' + error, "red");
-                    });
-
-                const checkfiles = async (files) => {
-                    const updateactions = files.find(files => files.name === "update_actions.json");
-                    if (updateactions) {
-                        await fetchAndPost(updateactions.url, updateactions.name, updateactions.path);
-                        try {
-                            const response = await fetch("update_actions", {
-                                method: "POST",
-                                body: ''
-                            });
-                            if (response.ok) {
-                                await response.text();
-                            } else {
-                                print(`error performing update actions: ${response.status}`, "red");
-                                errors++;
-                            }
-                        } catch (error) {
-                            console.error(`error calling update actions:` + error, "red");
-                            errors++;
-                        }
-                    }
-
-                    for (const file of files) {
-                        try {
-                            if (file.name != "update_actions.json") {
-                                const url = "check_file?path=" + encodeURIComponent(file.path);
-                                const response = await fetch(url);
-                                if (response.ok) {
-                                    const data = await response.json();
-                                    if (data.filesize == file.size && data.md5 == file.md5) {
-                                        print(`file ${file.path} is up to date`, "green");
-                                    } else if (data.filesize == 0) {
-                                        await fetchAndPost(file.url, file.name, file.path);
-                                    } else {
-                                        await fetchAndPost(file.url, file.name, file.path);
-                                    }
-                                } else {
-                                    print(`error checking file ${file.path}: ${response.status}`, "red");
-                                    errors++;
-                                }
-                            }
-                        } catch (error) {
-                            console.error(`error checking file ${file.path}:` + error, "red");
-                            errors++;
-                        }
-                    }
-                    writeVersion(tagname, "version.txt", "/www/version.txt")
-                    running = false;
-                    if (errors) {
-                        print("------", "gray");
-                        print(`Finished updating with ${errors} errors.`, "red");
-                        reject(error);
-                    } else {
-                        print("------", "gray");
-                        print("Update succesful.");
-                        resolve();
-                    }
-                    disableButtons(false);
-
-                    if (showReload) {
-                        const newLine = document.createElement('div');
-                        newLine.innerHTML = "<button onclick=\"location.reload()\">Reload this page</button>";
-                        consoleDiv.appendChild(newLine);
-                        consoleDiv.scrollTop = consoleDiv.scrollHeight;
-                    }
-                };
             } catch (error) {
-                print('Error: ' + error, "red");
+                print(`error calling update actions: ${error}`, "red");
                 errors++;
-                reject(error);
             }
-        })();
-    });
+        }
+
+        for (const file of files) {
+            if (file.name == "update_actions.json") continue;
+            try {
+                const response = await fetch("check_file?path=" + encodeURIComponent(file.path));
+                if (!response.ok) {
+                    print(`error checking file ${file.path}: ${response.status}`, "red");
+                    errors++;
+                    continue;
+                }
+                const data = await response.json();
+                if (data.filesize == file.size && data.md5 == file.md5) {
+                    print(`file ${file.path} is up to date`, "green");
+                } else {
+                    await fetchAndPost(file.url, file.name, file.path);
+                }
+            } catch (error) {
+                print(`error checking file ${file.path}: ${error}`, "red");
+                errors++;
+            }
+        }
+
+        // version.txt claims the release, so only write it when the release is
+        // actually complete.
+        if (!errors) await writeVersion(tagname, "version.txt", "/www/version.txt");
+
+        print("------", "gray");
+        if (errors) {
+            print(`Finished updating with ${errors} errors.`, "red");
+            return false;
+        }
+        print("Update succesful.");
+        return true;
+    } finally {
+        running = false;
+        disableButtons(false);
+        if (showReload) {
+            const newLine = document.createElement('div');
+            newLine.innerHTML = "<button onclick=\"location.reload()\">Reload this page</button>";
+            consoleDiv.appendChild(newLine);
+            consoleDiv.scrollTop = consoleDiv.scrollHeight;
+        }
+    }
 }
 
 export async function updateESP(fileUrl, showConfirm) {
@@ -413,7 +438,7 @@ export async function updateESP(fileUrl, showConfirm) {
 
     while (retryCount < maxRetries) {
         try {
-            const response = await fetch("//openepaperlink.eu/getupdate/?url=" + fileUrl + "&env=" + env);
+            const response = await fetchReleaseFile(fileUrl);
             const responseBody = await response.text();
             if (!response.ok) {
                 throw new Error("Network response was not OK: " + responseBody);
@@ -426,7 +451,7 @@ export async function updateESP(fileUrl, showConfirm) {
             const data = JSON.parse(responseBody);
             const file = data.find((entry) => entry.name == env + '.bin');
             if (file) {
-                binurl = "http://openepaperlink.eu/getupdate/?url=" + encodeURIComponent(file.url);
+                binurl = gLegacyProxy ? "http://openepaperlink.eu/getupdate/?url=" + encodeURIComponent(file.url) : file.url;
                 binmd5 = file.md5;
                 binsize = file.size;
                 console.log(`URL for "${file.name}": ${binurl}`);
@@ -455,7 +480,10 @@ export async function updateESP(fileUrl, showConfirm) {
                 }
                 break;
             } else {
+                // Not a network error, retrying won't help. Without this break
+                // the loop printed this line forever and froze the page.
                 print(`No info about "${env}" found in the release.`, "red");
+                break;
             }
         } catch (error) {
             print('Error: ' + error.message, "yellow");
@@ -524,6 +552,36 @@ export async function updateC6H2(Url, apType) {
     disableButtons(false);
 }
 
+$('#radioTestBtn').onclick = async function () {
+    if (running) return;
+    if (!confirm("Test the wiring to the radio? The radio is offline for about 10 seconds.")) return;
+    disableButtons(true);
+    running = true;
+    print("Radio wiring test...");
+    try {
+        const response = await fetch("radio_selftest", { method: "POST" });
+        if (!response.ok) {
+            print("Radio wiring test not started: " + await response.text(), "red");
+        } else {
+            // progress and findings arrive on the console through the websocket; wait for the end
+            let result = null;
+            for (let i = 0; i < 30; i++) {
+                await new Promise(r => setTimeout(r, 1000));
+                const r = await fetch("radio_selftest");
+                result = await r.json();
+                if (!result.running) break;
+            }
+            if (result && !result.running) {
+                print(result.ok ? "Radio wiring OK" : "Radio wiring: " + result.messages.join("; "), result.ok ? "green" : "red");
+            }
+        }
+    } catch (error) {
+        print("Radio wiring test: " + error, "red");
+    }
+    running = false;
+    disableButtons(false);
+}
+
 $('#updateTagtypeBtn').onclick = function () {
     const cleanup = $('#tagtype_clean').checked;
     fetchAndCheckTagtypes(cleanup);
@@ -544,8 +602,7 @@ $('#selectRepo').onclick = function (event) {
                 const filesJsonAsset = assets.find(asset => asset.name === 'filesystem.json');
                 const binariesJsonAsset = assets.find(asset => asset.name === 'binaries.json');
                 if (filesJsonAsset && binariesJsonAsset) {
-                    const updateUrl = "//openepaperlink.eu/getupdate/?url=" + binariesJsonAsset.browser_download_url + "&env=" + $('#repo').value;
-                    return fetch(updateUrl);
+                    return fetchReleaseFile(binariesJsonAsset.browser_download_url);
                 } else {
                     throw new Error("Json file binaries.json and/or filesystem.json not found in the release assets");
                 }
@@ -621,14 +678,6 @@ export function print(line, color = "white") {
         newLine.style.color = color;
         if (line == "[reboot]") {
             newLine.innerHTML = "<button onclick=\"otamodule.reboot()\">Reboot</button>";
-        } else if (line == "[autoreboot]") {
-            // The AP restarts by itself after flashing a co-processor. Nothing
-            // announces that to the browser - the socket simply dies - so the
-            // page would sit there looking busy forever. Reload once the AP has
-            // had time to boot and rejoin the network.
-            newLine.textContent = "Rebooting now... reloading this page in 8 seconds.";
-            newLine.style.color = "yellow";
-            setTimeout(() => { location.reload(); }, 8000);
         } else {
             newLine.textContent = line;
         }
@@ -679,7 +728,7 @@ const fetchAndPost = async (url, name, path) => {
         const response = await fetch(url);
 
         if (!response.ok) {
-            print(`download error: ${response.status} ${response.body}`, "red");
+            print(`download error ${path}: ${response.status}`, "red");
             errors++;
         } else {
             const fileContent = await response.blob();
@@ -694,7 +743,7 @@ const fetchAndPost = async (url, name, path) => {
             });
 
             if (!uploadResponse.ok) {
-                print(`upload error: ${uploadResponse.status} ${uploadResponse.body}`, "red");
+                print(`upload error ${path}: ${uploadResponse.status}`, "red");
                 errors++;
             }
         }
@@ -719,7 +768,7 @@ const writeVersion = async (content, name, path) => {
         });
 
         if (!uploadResponse.ok) {
-            print(`${response.status} ${response.body}`, "red");
+            print(`upload error ${path}: ${uploadResponse.status}`, "red");
             errors++;
         }
     } catch (error) {
@@ -740,7 +789,7 @@ async function fetchAndCheckTagtypes(cleanup) {
     const sortableGrid = $('#taglist');
     const gridItems = Array.from(sortableGrid.querySelectorAll('.tagcard:not(#tagtemplate)'));
     try {
-        const response = await fetch('/edit?list=%2Ftagtypes');
+        const response = await fetch('/edit?list=%2Ftagtypes&nosize=1');
         if (!response.ok) {
             print("Failed to fetch tagtypes list", "red");
             throw new Error('Failed to fetch tagtypes list');
@@ -762,28 +811,38 @@ async function fetchAndCheckTagtypes(cleanup) {
                     print("not in use, deleting", "yellow");
                     const formData = new FormData();
                     formData.append('path', '/tagtypes/' + filename);
-                    fetch('/edit', {
+                    await fetch('/edit', {
                         method: 'DELETE',
                         body: formData
-                    })
+                    });
                     check = false;
                 }
             }
 
+            // Per file: a type that is not on GitHub (a custom one) or a broken
+            // local copy must not stop the check for the types after it.
             if (check) {
-                let githubUrl = "https://raw.githubusercontent.com/" + repo + "/master/resources/tagtypes/" + filename;
+                try {
+                    let githubUrl = "https://raw.githubusercontent.com/" + repo + "/master/resources/tagtypes/" + filename;
 
-                const localResponse = await fetch(`/tagtypes/${filename}`);
-                const localJson = await localResponse.json();
-                const localVersion = localJson.version || 0;
+                    const localResponse = await fetch(`/tagtypes/${filename}`);
+                    const localJson = localResponse.ok ? await localResponse.json() : {};
+                    const localVersion = localJson.version || 0;
 
-                const githubResponse = await fetch(githubUrl);
-                const githubJson = await githubResponse.json();
-                const githubVersion = githubJson.version || 0;
+                    const githubResponse = await fetch(githubUrl);
+                    if (!githubResponse.ok) {
+                        print("not in the repo, kept as it is", "gray");
+                        continue;
+                    }
+                    const githubJson = await githubResponse.json();
+                    const githubVersion = githubJson.version || 0;
 
-                if (githubVersion > localVersion) {
-                    print("update from version " + localVersion + " to " + githubVersion);
-                    await fetchAndPost(githubUrl, filename, "/tagtypes/" + filename);
+                    if (githubVersion > localVersion) {
+                        print("update from version " + localVersion + " to " + githubVersion);
+                        await fetchAndPost(githubUrl, filename, "/tagtypes/" + filename);
+                    }
+                } catch (error) {
+                    print(`Error checking ${filename}: ${error}`, "red");
                 }
             }
         }
@@ -794,7 +853,13 @@ async function fetchAndCheckTagtypes(cleanup) {
 }
 
 function normalizeVersion(version) {
-    return version.replace(/(\.\d*?)0+$/, '$1').replace(/\.$/, '');
+    return String(version).replace(/(\.\d*?)0+$/, '$1').replace(/\.$/, '');
+}
+
+// "2.9" and "2.90" are the same release: the 2.90 release was tagged twice,
+// and the firmware built from either tag must not keep offering an update.
+function sameVersion(a, b) {
+    return normalizeVersion(a) == normalizeVersion(b);
 }
 
 // --- Co-processor flashing pins -------------------------------------------

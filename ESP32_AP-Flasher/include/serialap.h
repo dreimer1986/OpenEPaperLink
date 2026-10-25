@@ -21,6 +21,7 @@ struct APInfoS {
     uint8_t power;
     uint8_t pendingBuffer;
     uint8_t nop;
+    uint16_t caps = 0;  // protocol v2 capabilities (CAP> in the NFO? answer, HELLO_REPLY)
 #ifdef HAS_SUBGHZ
     bool hasSubGhz = false;
     uint8_t SubGhzChannel;
@@ -36,16 +37,12 @@ extern struct APInfoS apInfo;
    reported, so it is the only value that is actually true. */
 const char *apTypeName(uint8_t type);
 
-enum ApSerialState {
-    SERIAL_STATE_NONE,
-    SERIAL_STATE_INITIALIZED,
-    SERIAL_STATE_STARTING,
-    SERIAL_STATE_RUNNING,
-    SERIAL_STATE_STOP,
-    SERIAL_STATE_STOPPED
-};
-
-extern volatile ApSerialState gSerialTaskState;
+// The task that reads the radio's UART (rxSerialTask). Everything that needs the port for
+// something else (flashing, self-test) stops it first; bringAPOnline() starts it again.
+// startApReader() does nothing while it runs, so there is never more than one reader.
+bool startApReader();
+bool stopApReader();
+bool apReaderRunning();
 
 void APTask(void* parameter);
 
