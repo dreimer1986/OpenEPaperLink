@@ -458,15 +458,25 @@ void saveAPconfig() {
     xSemaphoreGive(fsMutex);
 }
 
+// hwdata is used from the loop task, the BLE writer and the web server (forgetHwType after an upload)
+static SemaphoreHandle_t hwdataMutex = xSemaphoreCreateMutex();
+
 void forgetHwType(const uint16_t id) {
+    xSemaphoreTake(hwdataMutex, portMAX_DELAY);
     hwdata.erase(id);
+    xSemaphoreGive(hwdataMutex);
 }
 
 HwType getHwType(const uint16_t id) {
+    xSemaphoreTake(hwdataMutex, portMAX_DELAY);
     auto it = hwdata.find(id);
     if (it != hwdata.end()) {
-        return it->second;
+        const HwType hwType = it->second;
+        xSemaphoreGive(hwdataMutex);
+        return hwType;
     } else {
+        // read the file without the lock, and only add the complete type to the cache
+        xSemaphoreGive(hwdataMutex);
         char filename[20];
         snprintf(filename, sizeof(filename), id > 0xFF ? "/tagtypes/%04X.json" : "/tagtypes/%02X.json", id);
         Serial.printf("read %s\r\n", filename);
@@ -490,7 +500,7 @@ HwType getHwType(const uint16_t id) {
                 Serial.println("json error in " + String(filename));
                 Serial.println(error.c_str());
             } else {
-                HwType& hwType = hwdata[id];
+                HwType hwType = {};
                 hwType.id = id;
                 hwType.width = doc["width"];
                 hwType.height = doc["height"];
@@ -517,7 +527,10 @@ HwType getHwType(const uint16_t id) {
                     c.b = color[2];
                     hwType.colortable.push_back(c);
                 }
-                return hwdata.at(id);
+                xSemaphoreTake(hwdataMutex, portMAX_DELAY);
+                hwdata[id] = hwType;
+                xSemaphoreGive(hwdataMutex);
+                return hwType;
             }
         }
         return {0, 0, 0, 0, 0, 0, 0};
@@ -610,7 +623,26 @@ void popTagInfo(const uint8_t mac[8]) {
     // find first, then delete: deleteRecord() erases from tagDB, so it can't be called while iterating over it
     tagRecord* saved = findSavedTagInfo(mac);
     if (saved == nullptr) return;
-    deleteRecord(mac, false);
-    saved->version = 0;
+    tagRecord* taginfo = tagRecord::findByMAC(mac);
+    if (taginfo == nullptr) {
+        saved->version = 0;
+    } else {
+        // Put back only what the temporary content changed. The rest of the saved copy is as old as the
+        // copy, so the tag's status (last seen, battery, pending, ...) stays as it is now.
+        taginfo->contentMode = saved->contentMode;
+        taginfo->modeConfigJson = saved->modeConfigJson;
+        taginfo->nextupdate = saved->nextupdate;
+        memcpy(taginfo->md5, saved->md5, sizeof(taginfo->md5));
+        taginfo->filename = saved->filename;
+        taginfo->dataType = saved->dataType;
+        taginfo->imageDataType = saved->imageDataType;
+        for (size_t c = 0; c < tagDB.size(); c++) {
+            if (tagDB[c] == saved) {
+                tagDB.erase(tagDB.begin() + c);
+                break;
+            }
+        }
+        deletedRecords.push_back({saved, millis()});
+    }
     radioAllowListChanged(mac, true);
 }
