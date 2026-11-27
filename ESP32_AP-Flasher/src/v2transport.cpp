@@ -398,8 +398,10 @@ bool V2Transport::setChannelPower(struct espSetChannelPower* scp) {
     sc.channel = scp->channel ? scp->channel : V2_CFG_UNCHANGED_U8;
 #ifdef HAS_SUBGHZ
     sc.subghzChannel = scp->subghzchannel;
+    sc.subghzSpeed = config.subghzspeed;
 #else
     sc.subghzChannel = V2_CFG_UNCHANGED_U8;
+    sc.subghzSpeed = V2_CFG_UNCHANGED_U8;
 #endif
     sc.txPowerDbm = (int8_t)scp->power;
     sc.flags = allowListReady ? (config.lock << V2_CFG_LOCK_SHIFT) & V2_CFG_LOCK_MASK : 0;
@@ -504,6 +506,8 @@ void V2Transport::applyStatus(const uint8_t* payload, size_t len) {
     apInfo.pendingBuffer = st.pending > 255 ? 255 : st.pending;
     apInfo.nop = st.pendingIdle > 255 ? 255 : st.pendingIdle;
     cacheFreeKb = (int32_t)cacheKb - st.cacheUsedKb;
+    radioTxFrames = st.txFrames;
+    radioRxFrames = st.rxFrames;
 #ifdef HAS_SUBGHZ
     apInfo.hasSubGhz = st.subghzChannel != V2_NO_SUBGHZ_CHANNEL;
     apInfo.SubGhzChannel = apInfo.hasSubGhz ? st.subghzChannel : 0;
